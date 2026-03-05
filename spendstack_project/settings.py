@@ -25,7 +25,13 @@ SECRET_KEY = 'django-insecure-vk543s=4^l1y7f60l&=v0!o1eb69o0x^=h%n!%byarfhawilhm
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    'spendstack.vercel.app',
+    'spendstack-backend.onrender.com',
+    'localhost',
+    '127.0.0.1',
+    '*',
+]
 
 
 # Application definition
@@ -137,7 +143,12 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 AUTH_USER_MODEL = 'users.User'
 
 # CORS
-CORS_ALLOW_ALL_ORIGINS = True # For development prototype
+CORS_ALLOWED_ORIGINS = [
+    "https://spendstack.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+CORS_ALLOW_ALL_ORIGINS = True # Fallback for development, can be set to False for strict production CORS
 
 # DRF Configuration
 REST_FRAMEWORK = {
