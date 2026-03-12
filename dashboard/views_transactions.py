@@ -1,10 +1,13 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
 from transactions.models import Transaction
 
 class DashboardTransactionsView(APIView):
+    permission_classes = [IsAuthenticated]
+    
     def get(self, request):
-        user_id = 1 if not request.user.is_authenticated else request.user.id
+        user_id = request.user.id
         
         # Get 10 most recent transactions
         transactions = Transaction.objects.filter(

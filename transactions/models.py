@@ -25,6 +25,7 @@ class Category(models.Model):
 
 class Transaction(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='transactions')
+    statement = models.ForeignKey('analysis.Statement', on_delete=models.CASCADE, null=True, blank=True, related_name='transactions')
     account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name='transactions', null=True, blank=True)
     category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True, blank=True, related_name='transactions')
     

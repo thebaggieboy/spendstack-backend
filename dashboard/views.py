@@ -1,5 +1,6 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
 from django.db import models
 from django.db.models import Sum, Count, F, Min
 from django.db.models.functions import TruncDate
@@ -8,8 +9,10 @@ from django.utils import timezone
 from transactions.models import Transaction, Category
 
 class DashboardOverviewView(APIView):
+    permission_classes = [IsAuthenticated]
+    
     def get(self, request):
-        user_id = 1 if not request.user.is_authenticated else request.user.id
+        user_id = request.user.id
 
         txs = Transaction.objects.filter(user_id=user_id)
 
@@ -60,8 +63,10 @@ class DashboardOverviewView(APIView):
         })
 
 class CategoryBreakdownView(APIView):
+    permission_classes = [IsAuthenticated]
+    
     def get(self, request):
-        user_id = 1 if not request.user.is_authenticated else request.user.id
+        user_id = request.user.id
 
         breakdown = Transaction.objects.filter(
             user_id=user_id, 
@@ -85,8 +90,10 @@ class CategoryBreakdownView(APIView):
         return Response(sorted(data, key=lambda x: x['value'], reverse=True))
 
 class CashFlowView(APIView):
+    permission_classes = [IsAuthenticated]
+    
     def get(self, request):
-        user_id = 1 if not request.user.is_authenticated else request.user.id
+        user_id = request.user.id
 
         transactions = Transaction.objects.filter(user_id=user_id).order_by('date')
         
@@ -112,8 +119,10 @@ class CashFlowView(APIView):
         return Response(data)
 
 class TopMerchantsView(APIView):
+    permission_classes = [IsAuthenticated]
+    
     def get(self, request):
-        user_id = 1 if not request.user.is_authenticated else request.user.id
+        user_id = request.user.id
 
         merchants = Transaction.objects.filter(
             user_id=user_id,

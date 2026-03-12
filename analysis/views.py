@@ -1,13 +1,16 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
 from .utils.parser import parse_csv_statement, parse_pdf_statement
 from .utils.ai_categorizer import categorize_transactions
 from transactions.models import Transaction, Account, Category
+from .models import Statement
 import json
 
 class StatementUploadView(APIView):
+    permission_classes = [IsAuthenticated]
     parser_classes = (MultiPartParser, FormParser)
 
     def post(self, request, *args, **kwargs):
@@ -33,17 +36,16 @@ class StatementUploadView(APIView):
             categorized_data = categorize_transactions(raw_data)
             
             # 4. Save to DB
-            from django.contrib.auth import get_user_model
-            User = get_user_model()
-            
-            user = request.user if request.user.is_authenticated else None
-            if not user:
-                user, _ = User.objects.get_or_create(username='demo_user', defaults={'email': 'demo@spendstack.com'})
-            
+            user = request.user            
             # Mock grabbing an account for this prototype
             account, _ = Account.objects.get_or_create(
                 name="Default Checking", 
                 defaults={"user": user} # Hacky fallback for prototype
+            )
+            
+            statement = Statement.objects.create(
+                user=user,
+                filename=file_obj.name,
             )
 
             created_transactions = []
@@ -59,6 +61,7 @@ class StatementUploadView(APIView):
                     obj = Transaction.objects.create(
                         user=user, 
                         account=account,
+                        statement=statement,
                         date=tx['date'],
                         amount=tx['amount'],
                         merchant_name=tx.get('merchant_name', 'Unknown'),
@@ -78,3 +81,20 @@ class StatementUploadView(APIView):
             import traceback
             traceback.print_exc()
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class StatementListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        statements = Statement.objects.filter(user=request.user).order_by('-upload_date')
+        data = []
+        for stmt in statements:
+            tx_count = stmt.transactions.count()
+            data.append({
+                "id": stmt.id,
+                "filename": stmt.filename,
+                "upload_date": stmt.upload_date.strftime('%b %d, %Y'),
+                "transaction_count": tx_count
+            })
+            
+        return Response(data)
