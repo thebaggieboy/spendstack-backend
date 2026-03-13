@@ -84,52 +84,95 @@ def parse_csv_statement(file_content):
 
 def parse_pdf_statement(file_obj):
     """
-    Extracts text using PDFPlumber and then asks Gemini to convert it into structured transactions.
+    Extracts transactions from a PDF bank statement.
+    Strategy:
+    1. Try pdfplumber to get text (works for non-encrypted PDFs).
+    2. If the PDF is encrypted/password-protected, fall back to uploading the raw bytes
+       directly to the Gemini Files API, which can natively read owner-locked PDFs like
+       most Nigerian bank statements (GTBank, UBA, Access Bank, Zenith, etc.).
     """
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("NEXT_GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY must be set for PDF extraction.")
+
+    client = genai.Client(api_key=api_key)
+
+    # --- Strategy 1: Try pdfplumber text extraction ---
+    text_content = ""
+    use_file_upload = False
+
     try:
-        text_content = ""
-        with pdfplumber.open(file_obj) as pdf:
+        # Read file bytes once so we can reuse them if pdfplumber fails
+        file_bytes = file_obj.read()
+        file_obj.seek(0)  # reset in case caller needs to re-read
+
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
                 extracted = page.extract_text()
                 if extracted:
                     text_content += extracted + "\n"
-        
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("NEXT_GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY or NEXT_GEMINI_API_KEY must be set for PDF extraction.")
-            
-        client = genai.Client(api_key=api_key)
-        
-        prompt = f"""
-        You are a precise data extraction AI. You are given the raw text extracted from a Nigerian bank statement PDF.
-        Extract all the transaction records from this text.
-        Look for lines that look like transaction records (Date, Description, Amount, etc.).
-        Convert them into a JSON array of objects.
-        Each object MUST have the following keys:
-        - "date": string, the date of the transaction formatted strictly as YYYY-MM-DD. Pay attention to the fact that these are Nigerian bank statements, so the dates in the text are almost always DD/MM/YYYY or DD/MM/YY. You must convert them to YYYY-MM-DD!
-        - "raw_description": string, the full raw description/narration
-        - "amount": float, the amount. Expenses/debits MUST be negative. Income/credits MUST be positive.
 
-        If the text contains no transactions, return an empty array [].
-        Return ONLY valid JSON array with no markdown formatting.
-        
-        Raw text to process:
-        {text_content}
-        """
-        
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        
+        if not text_content.strip():
+            # pdfplumber opened OK but extracted nothing — try Gemini with file upload
+            use_file_upload = True
+
+    except Exception:
+        # Most likely PDFPasswordIncorrect or another encryption error
+        use_file_upload = True
+
+    PROMPT_INSTRUCTIONS = """
+You are a precise data extraction AI processing a Nigerian bank statement.
+Extract ALL transaction records from the document.
+Convert them into a JSON array of objects. Each object MUST have:
+- "date": string, formatted strictly as YYYY-MM-DD. Nigerian statements use DD/MM/YYYY or DD/MM/YY — convert accordingly.
+- "raw_description": string, the full raw description/narration of the transaction.
+- "amount": float, the transaction amount. Debits/withdrawals/expenses MUST be negative. Credits/deposits/income MUST be positive.
+
+If there are no transactions, return an empty array [].
+Return ONLY a valid JSON array with no markdown formatting or extra explanation.
+"""
+
+    try:
+        if use_file_upload:
+            # --- Strategy 2: Upload raw PDF bytes to Gemini Files API ---
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+
+            try:
+                uploaded_file = client.files.upload(
+                    file=tmp_path,
+                    config={"display_name": "bank_statement.pdf"}
+                )
+
+                response = client.models.generate_content(
+                    model='gemini-2.0-flash',
+                    contents=[uploaded_file, PROMPT_INSTRUCTIONS],
+                )
+            finally:
+                os.unlink(tmp_path)  # clean up temp file
+
+        else:
+            # --- Strategy 1 continued: Send extracted text to Gemini ---
+            prompt = f"{PROMPT_INSTRUCTIONS}\n\nRaw text:\n{text_content}"
+            response = client.models.generate_content(
+                model='gemini-2.0-flash',
+                contents=prompt,
+            )
+
         res_text = response.text.strip()
         if res_text.startswith("```json"):
             res_text = res_text[7:]
+        if res_text.startswith("```"):
+            res_text = res_text[3:]
         if res_text.endswith("```"):
             res_text = res_text[:-3]
-            
+
         transactions = json.loads(res_text.strip())
         return transactions
-        
+
     except Exception as e:
         raise ValueError(f"Failed to extract PDF: {str(e)}")
+
