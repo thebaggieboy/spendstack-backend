@@ -97,3 +97,79 @@ class StatementListView(APIView):
             })
             
         return Response(data)
+
+
+class StatementDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        from django.db.models import Sum, Count, Q
+        from django.shortcuts import get_object_or_404
+
+        stmt = get_object_or_404(Statement, pk=pk, user=request.user)
+        transactions = stmt.transactions.select_related('category').order_by('date', 'id')
+
+        # Aggregate stats
+        income = transactions.filter(amount__gt=0).aggregate(total=Sum('amount'))['total'] or 0
+        expenses = transactions.filter(amount__lt=0).aggregate(total=Sum('amount'))['total'] or 0
+        merchant_count = transactions.values('merchant_name').distinct().count()
+
+        # Build running balance timeline
+        tx_list = []
+        running_balance = 0.0
+        for tx in transactions:
+            running_balance += float(tx.amount)
+            tx_list.append({
+                "id": tx.id,
+                "date": tx.date.strftime('%Y-%m-%d'),
+                "date_display": tx.date.strftime('%b %d'),
+                "raw_description": tx.raw_description,
+                "merchant_name": tx.merchant_name or tx.raw_description[:40],
+                "amount": float(tx.amount),
+                "category": tx.category.name if tx.category else "Uncategorized",
+                "category_color": tx.category.color if tx.category else "#9ca3af",
+                "running_balance": round(running_balance, 2),
+            })
+
+        # Category breakdown (expenses only)
+        category_data = []
+        from django.db.models import F
+        cat_qs = transactions.filter(amount__lt=0).values(
+            name=F('category__name'),
+            color=F('category__color')
+        ).annotate(total=Sum('amount')).order_by('total')
+        for c in cat_qs:
+            category_data.append({
+                "name": c['name'] or "Uncategorized",
+                "value": round(float(abs(c['total'])), 2),
+                "color": c['color'] or "#9ca3af",
+            })
+
+        # Daily spending aggregation
+        daily_map: dict = {}
+        for tx in tx_list:
+            d = tx['date_display']
+            if d not in daily_map:
+                daily_map[d] = {"date": d, "income": 0.0, "expenses": 0.0}
+            if tx['amount'] > 0:
+                daily_map[d]['income'] += tx['amount']
+            else:
+                daily_map[d]['expenses'] += abs(tx['amount'])
+        daily_data = list(daily_map.values())
+
+        return Response({
+            "id": stmt.id,
+            "filename": stmt.filename,
+            "upload_date": stmt.upload_date.strftime('%B %d, %Y'),
+            "stats": {
+                "total_income": round(float(income), 2),
+                "total_expenses": round(float(abs(expenses)), 2),
+                "net": round(float(income) + float(expenses), 2),
+                "transaction_count": transactions.count(),
+                "merchant_count": merchant_count,
+            },
+            "transactions": tx_list,
+            "category_breakdown": category_data,
+            "daily_data": daily_data,
+        })
+
