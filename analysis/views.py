@@ -37,10 +37,9 @@ class StatementUploadView(APIView):
             
             # 4. Save to DB
             user = request.user            
-            # Mock grabbing an account for this prototype
             account, _ = Account.objects.get_or_create(
                 name="Default Checking", 
-                defaults={"user": user} # Hacky fallback for prototype
+                user=user
             )
             
             statement = Statement.objects.create(
