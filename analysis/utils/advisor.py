@@ -16,12 +16,12 @@ def generate_financial_advice(user_id):
 
     # Extract all expenses
     expenses = list(Transaction.objects.filter(
-        user_id=user_id, amount__lt=0
+        user_id=user_id, amount__lt=0, is_transfer=False
     ).values(name=F('category__name')).annotate(total=Sum('amount')).order_by('total'))
     
     # Extract top 3 largest transactions
     largest_txs = list(Transaction.objects.filter(
-        user_id=user_id, amount__lt=0
+        user_id=user_id, amount__lt=0, is_transfer=False
     ).order_by('amount').values('merchant_name', 'amount', 'date')[:3])
 
     context = {

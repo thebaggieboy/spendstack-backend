@@ -33,7 +33,7 @@ class SpendingInsightsView(APIView):
 
     def get(self, request):
         user_id = request.user.id
-        txs = Transaction.objects.filter(user_id=user_id)
+        txs = Transaction.objects.filter(user_id=user_id, is_transfer=False)
 
         if not txs.exists():
             return Response({})
@@ -124,7 +124,7 @@ class MonthlyTrendView(APIView):
 
     def get(self, request):
         user_id = request.user.id
-        txs = Transaction.objects.filter(user_id=user_id)
+        txs = Transaction.objects.filter(user_id=user_id, is_transfer=False)
 
         if not txs.exists():
             return Response([])

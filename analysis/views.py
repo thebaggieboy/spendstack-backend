@@ -7,6 +7,8 @@ from .utils.parser import parse_csv_statement, parse_pdf_statement
 from .utils.ai_categorizer import categorize_transactions
 from transactions.models import Transaction, Account, Category
 from .models import Statement
+from transactions.models import TransactionRule
+from transactions.services import classify_transaction
 import json
 
 class StatementUploadView(APIView):
@@ -48,28 +50,37 @@ class StatementUploadView(APIView):
             )
 
             created_transactions = []
+            rules = list(
+                TransactionRule.objects.filter(user=user, is_active=True).order_by("-priority", "id")
+            )
             for tx in categorized_data:
-                # Ensure category exists dynamically
-                cat_name = tx.get('category_name', 'Other')
+                base_merchant = tx.get('merchant_name', 'Unknown')
+                base_category = tx.get('category_name', 'Other')
+                merchant_name, cat_name, is_transfer = classify_transaction(
+                    tx.get('raw_description', ''),
+                    base_merchant,
+                    base_category,
+                    rules,
+                )
                 cat, _ = Category.objects.get_or_create(
                     name=cat_name, 
-                    defaults={"color": "#9ca3af", "is_system": False}
+                    defaults={"color": "#9ca3af", "is_system": cat_name == "Transfers"}
                 )
                 
-                try:
-                    obj = Transaction.objects.create(
-                        user=user, 
-                        account=account,
-                        statement=statement,
-                        date=tx['date'],
-                        amount=tx['amount'],
-                        merchant_name=tx.get('merchant_name', 'Unknown'),
-                        raw_description=tx['raw_description'],
-                        category=cat
-                    )
-                    created_transactions.append(obj.id)
-                except Exception as e:
-                    print(f"Failed saving tx: {e}")
+                obj = Transaction.objects.create(
+                    user=user,
+                    account=account,
+                    statement=statement,
+                    date=tx['date'],
+                    amount=tx['amount'],
+                    merchant_name=merchant_name,
+                    original_merchant_name=base_merchant,
+                    original_category_name=base_category,
+                    raw_description=tx['raw_description'],
+                    category=cat,
+                    is_transfer=is_transfer,
+                )
+                created_transactions.append(obj.id)
 
             return Response({
                 "message": f"Successfully processed {len(created_transactions)} transactions.",
@@ -110,9 +121,10 @@ class StatementDetailView(APIView):
         transactions = stmt.transactions.select_related('category').order_by('date', 'id')
 
         # Aggregate stats
-        income = transactions.filter(amount__gt=0).aggregate(total=Sum('amount'))['total'] or 0
-        expenses = transactions.filter(amount__lt=0).aggregate(total=Sum('amount'))['total'] or 0
-        merchant_count = transactions.values('merchant_name').distinct().count()
+        financial_transactions = transactions.filter(is_transfer=False)
+        income = financial_transactions.filter(amount__gt=0).aggregate(total=Sum('amount'))['total'] or 0
+        expenses = financial_transactions.filter(amount__lt=0).aggregate(total=Sum('amount'))['total'] or 0
+        merchant_count = financial_transactions.values('merchant_name').distinct().count()
 
         # Build running balance timeline
         tx_list = []
@@ -129,12 +141,13 @@ class StatementDetailView(APIView):
                 "category": tx.category.name if tx.category else "Uncategorized",
                 "category_color": tx.category.color if tx.category else "#9ca3af",
                 "running_balance": round(running_balance, 2),
+                "is_transfer": tx.is_transfer,
             })
 
         # Category breakdown (expenses only)
         category_data = []
         from django.db.models import F
-        cat_qs = transactions.filter(amount__lt=0).values(
+        cat_qs = financial_transactions.filter(amount__lt=0).values(
             name=F('category__name'),
             color=F('category__color')
         ).annotate(total=Sum('amount')).order_by('total')
@@ -148,6 +161,8 @@ class StatementDetailView(APIView):
         # Daily spending aggregation
         daily_map: dict = {}
         for tx in tx_list:
+            if tx['is_transfer']:
+                continue
             d = tx['date_display']
             if d not in daily_map:
                 daily_map[d] = {"date": d, "income": 0.0, "expenses": 0.0}
@@ -172,4 +187,3 @@ class StatementDetailView(APIView):
             "category_breakdown": category_data,
             "daily_data": daily_data,
         })
-

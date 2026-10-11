@@ -21,7 +21,8 @@ class DashboardTransactionsView(APIView):
                 "amount": float(t.amount),
                 "date": t.date.strftime('%b %d, %Y'),
                 "category": t.category.name if t.category else 'Uncategorized',
-                "status": "completed" if not t.is_pending else "pending"
+                "status": "completed" if not t.is_pending else "pending",
+                "is_transfer": t.is_transfer,
             }
             for t in transactions
         ]

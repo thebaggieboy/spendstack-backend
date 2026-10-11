@@ -6,6 +6,8 @@ import os
 import json
 from google import genai
 
+GEMINI_PDF_MODEL = "gemini-3.8-flash"
+
 def parse_csv_statement(file_content):
     """
     Basic heuristic-based CSV parser.
@@ -148,7 +150,7 @@ Return ONLY a valid JSON array with no markdown formatting or extra explanation.
                 )
 
                 response = client.models.generate_content(
-                    model='gemini-2.0-flash',
+                    model=GEMINI_PDF_MODEL,
                     contents=[uploaded_file, PROMPT_INSTRUCTIONS],
                 )
             finally:
@@ -158,7 +160,7 @@ Return ONLY a valid JSON array with no markdown formatting or extra explanation.
             # --- Strategy 1 continued: Send extracted text to Gemini ---
             prompt = f"{PROMPT_INSTRUCTIONS}\n\nRaw text:\n{text_content}"
             response = client.models.generate_content(
-                model='gemini-2.0-flash',
+                model=GEMINI_PDF_MODEL,
                 contents=prompt,
             )
 
@@ -175,4 +177,3 @@ Return ONLY a valid JSON array with no markdown formatting or extra explanation.
 
     except Exception as e:
         raise ValueError(f"Failed to extract PDF: {str(e)}")
-

@@ -14,7 +14,7 @@ class DashboardOverviewView(APIView):
     def get(self, request):
         user_id = request.user.id
 
-        txs = Transaction.objects.filter(user_id=user_id)
+        txs = Transaction.objects.filter(user_id=user_id, is_transfer=False)
 
         income = txs.filter(amount__gt=0).aggregate(total=Sum('amount'))['total'] or 0
         expenses = txs.filter(amount__lt=0).aggregate(total=Sum('amount'))['total'] or 0
@@ -70,7 +70,8 @@ class CategoryBreakdownView(APIView):
 
         breakdown = Transaction.objects.filter(
             user_id=user_id, 
-            amount__lt=0
+            amount__lt=0,
+            is_transfer=False,
         ).values(
             name=F('category__name'),
             color=F('category__color')
@@ -95,7 +96,10 @@ class CashFlowView(APIView):
     def get(self, request):
         user_id = request.user.id
 
-        transactions = Transaction.objects.filter(user_id=user_id).order_by('date')
+        transactions = Transaction.objects.filter(
+            user_id=user_id,
+            is_transfer=False,
+        ).order_by('date')
         
         daily_stats = {}
         for tx in transactions:
@@ -126,7 +130,8 @@ class TopMerchantsView(APIView):
 
         merchants = Transaction.objects.filter(
             user_id=user_id,
-            amount__lt=0
+            amount__lt=0,
+            is_transfer=False,
         ).values(
             'merchant_name', 
             cat_name=F('category__name')
