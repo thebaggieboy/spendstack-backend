@@ -9,6 +9,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from billing.permissions import HasActiveProSubscription
 from .models import SpendingAlert, Transaction, TransactionRule
 from .serializers import SpendingAlertSerializer, TransactionRuleSerializer
 from .services import reapply_transaction_rules
@@ -41,6 +42,12 @@ def _alert_payload(alert, user):
 class SpendingAlertListView(APIView):
     permission_classes = [IsAuthenticated]
 
+    def get_permissions(self):
+        permissions = [IsAuthenticated()]
+        if self.request.method == "POST":
+            permissions.append(HasActiveProSubscription())
+        return permissions
+
     def get(self, request):
         alerts = SpendingAlert.objects.filter(user=request.user)
         return Response([_alert_payload(alert, request.user) for alert in alerts])
@@ -57,6 +64,12 @@ class SpendingAlertListView(APIView):
 
 class SpendingAlertDetailView(APIView):
     permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated()]
+        if self.request.method in ("PATCH", "PUT"):
+            permissions.append(HasActiveProSubscription())
+        return permissions
 
     def patch(self, request, pk):
         alert = get_object_or_404(SpendingAlert, pk=pk, user=request.user)
@@ -77,7 +90,7 @@ class SpendingAlertDetailView(APIView):
 
 
 class RecurringBillsView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveProSubscription]
 
     def get(self, request):
         from .services import detect_recurring_bills
@@ -92,6 +105,12 @@ class RecurringBillsView(APIView):
 
 class TransactionRuleListView(APIView):
     permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated()]
+        if self.request.method == "POST":
+            permissions.append(HasActiveProSubscription())
+        return permissions
 
     def get(self, request):
         serializer = TransactionRuleSerializer(
@@ -114,6 +133,12 @@ class TransactionRuleListView(APIView):
 
 class TransactionRuleDetailView(APIView):
     permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        permissions = [IsAuthenticated()]
+        if self.request.method in ("PATCH", "PUT"):
+            permissions.append(HasActiveProSubscription())
+        return permissions
 
     @db_transaction.atomic
     def patch(self, request, pk):

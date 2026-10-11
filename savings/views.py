@@ -8,7 +8,7 @@ from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
-from django.db import IntegrityError, transaction
+from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import Sum
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -19,6 +19,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from transactions.models import Transaction
+from billing.services import BillingError, process_subscription_event
 from .models import BankAccount, Budget, LockPeriod, Schedule, Wallet, WalletTransaction
 from .paystack import PaystackError, paystack_request
 from .services import (
@@ -225,6 +226,18 @@ class PaystackWebhookView(APIView):
             reference = data.get("reference")
             if reference:
                 finalize_payout_attempt(reference, event_type, data)
+        elif event_type in {
+            "subscription.create",
+            "subscription.disable",
+            "subscription.not_renew",
+            "invoice.payment_successful",
+            "invoice.payment_failed",
+        }:
+            try:
+                process_subscription_event(event_type, data)
+            except (BillingError, DatabaseError, TypeError, ValueError, KeyError):
+                logger.exception("Could not process signed Paystack subscription event.")
+                return HttpResponse(status=503)
         return HttpResponse(status=200)
 
 

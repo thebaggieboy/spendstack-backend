@@ -10,7 +10,11 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
-from .utils.parser import parse_csv_statement_detailed, parse_pdf_statement
+from .utils.parser import (
+    parse_csv_statement_detailed,
+    parse_excel_statement_detailed,
+    parse_pdf_statement,
+)
 from .utils.ai_categorizer import categorize_transactions
 from transactions.models import Transaction, Account, Category
 from .models import Statement, StatementPreview
@@ -27,11 +31,13 @@ def _parse_statement_file(file_obj, content):
     warnings = []
     if extension == ".csv":
         raw_data, warnings = parse_csv_statement_detailed(content)
+    elif extension in (".xlsx", ".xls"):
+        raw_data, warnings = parse_excel_statement_detailed(content)
     elif extension == ".pdf":
         import io
         raw_data = parse_pdf_statement(io.BytesIO(content))
     else:
-        raise ValueError("Unsupported file format. Use CSV or PDF.")
+        raise ValueError("Unsupported file format. Use CSV, Excel, or PDF.")
 
     if not raw_data:
         raise ValueError("No valid transactions were found in this statement.")
@@ -134,7 +140,10 @@ class StatementPreviewView(APIView):
     def post(self, request):
         file_obj = request.data.get("file")
         if not file_obj:
-            return Response({"detail": "Choose a CSV or PDF statement."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Choose a CSV, Excel, or PDF statement."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if file_obj.size > MAX_STATEMENT_SIZE:
             return Response({"detail": "Statement files must be 10 MB or smaller."}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
 
@@ -247,7 +256,10 @@ class StatementUploadView(APIView):
     def post(self, request, *args, **kwargs):
         file_obj = request.data.get("file")
         if not file_obj:
-            return Response({"detail": "Choose a CSV or PDF statement."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Choose a CSV, Excel, or PDF statement."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if file_obj.size > MAX_STATEMENT_SIZE:
             return Response({"detail": "Statement files must be 10 MB or smaller."}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
 

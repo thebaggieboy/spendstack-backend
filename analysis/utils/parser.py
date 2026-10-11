@@ -1,9 +1,9 @@
 import pandas as pd
 import pdfplumber
 import io
-import re
 import os
 import json
+import base64
 from google import genai
 
 GEMINI_PDF_MODEL = "gemini-3.8-flash"
@@ -20,89 +20,92 @@ def parse_csv_statement_detailed(file_content):
     Returns accepted rows alongside row-specific warnings.
     """
     try:
-        df = pd.read_csv(io.StringIO(file_content.decode('utf-8')))
-        df.columns = [str(column).strip().lower() for column in df.columns]
-        col_names = list(df.columns)
-        
-        date_col = next((c for c in col_names if 'date' in c), None)
-        desc_col = next((c for c in col_names if 'description' in c or 'name' in c or 'details' in c or 'remarks' in c), None)
-        
-        # Nigerian banks often split into Debit/Credit or Withdrawal/Deposit
-        amount_col = next((c for c in col_names if 'amount' in c), None)
-        debit_col = next((c for c in col_names if 'debit' in c or 'withdrawal' in c), None)
-        credit_col = next((c for c in col_names if 'credit' in c or 'deposit' in c), None)
-
-        if not date_col or not desc_col:
-            raise ValueError("Could not auto-detect Date and Description columns.")
-            
-        if not amount_col and not (debit_col and credit_col):
-            raise ValueError("Could not auto-detect Amount or Debit/Credit columns.")
-
-        transactions = []
-        warnings = []
-        for index, row in df.iterrows():
-            if pd.isna(row[date_col]) or pd.isna(row[desc_col]):
-                warnings.append(f"Row {index + 2}: missing date or description; skipped.")
-                continue
-                
-            # Determine actual amount
-            amount_val = 0.0
-            if amount_col and not pd.isna(row[amount_col]):
-                raw_amt = str(row[amount_col]).replace('₦', '').replace('$', '').replace(',', '')
-                try:
-                    amount_val = float(raw_amt)
-                except ValueError:
-                    warnings.append(f"Row {index + 2}: invalid amount; skipped.")
-                    continue
-            else:
-                # Handle split Debit / Credit
-                if debit_col and not pd.isna(row[debit_col]):
-                    raw_debit = str(row[debit_col]).replace('₦', '').replace(',', '')
-                    try:
-                        amount_val = -float(raw_debit)
-                    except ValueError:
-                        warnings.append(f"Row {index + 2}: invalid debit amount; skipped.")
-                        pass
-                elif credit_col and not pd.isna(row[credit_col]):
-                    raw_credit = str(row[credit_col]).replace('₦', '').replace(',', '')
-                    try:
-                        amount_val = float(raw_credit)
-                    except ValueError:
-                        warnings.append(f"Row {index + 2}: invalid credit amount; skipped.")
-                        pass
-                        
-            if amount_val == 0.0:
-                warnings.append(f"Row {index + 2}: zero or missing amount; skipped.")
-                continue
-
-            # Parse date safely (assuming Nigerian day-first format usually)
-            raw_date = str(row[date_col]).strip()
-            try:
-                # Use pandas to_datetime which is robust, handling dayfirst
-                dt = pd.to_datetime(raw_date, dayfirst=True)
-                date_val = dt.strftime('%Y-%m-%d')
-            except Exception:
-                warnings.append(f"Row {index + 2}: invalid date; skipped.")
-                continue
-
-            transactions.append({
-                "date": date_val,
-                "raw_description": str(row[desc_col]),
-                "amount": amount_val
-            })
-            
-        return transactions, warnings
+        df = pd.read_csv(io.StringIO(file_content.decode("utf-8-sig")))
+        return _parse_tabular_statement(df)
     except Exception as e:
         raise ValueError(f"Failed to parse CSV: {str(e)}")
 
+
+def parse_excel_statement_detailed(file_content):
+    """Parse the first worksheet in an .xlsx or .xls bank statement."""
+    try:
+        df = pd.read_excel(io.BytesIO(file_content), sheet_name=0)
+        return _parse_tabular_statement(df)
+    except Exception as e:
+        raise ValueError(f"Failed to parse Excel statement: {str(e)}")
+
+
+def _parse_tabular_statement(df):
+    df.columns = [str(column).strip().lower() for column in df.columns]
+    col_names = list(df.columns)
+
+    date_col = next((c for c in col_names if "date" in c), None)
+    desc_col = next(
+        (c for c in col_names if any(term in c for term in ("description", "name", "details", "remarks"))),
+        None,
+    )
+    amount_col = next((c for c in col_names if "amount" in c), None)
+    debit_col = next((c for c in col_names if "debit" in c or "withdrawal" in c), None)
+    credit_col = next((c for c in col_names if "credit" in c or "deposit" in c), None)
+
+    if not date_col or not desc_col:
+        raise ValueError("Could not auto-detect Date and Description columns.")
+    if not amount_col and not (debit_col and credit_col):
+        raise ValueError("Could not auto-detect Amount or Debit/Credit columns.")
+
+    transactions = []
+    warnings = []
+    for index, row in df.iterrows():
+        if pd.isna(row[date_col]) or pd.isna(row[desc_col]):
+            warnings.append(f"Row {index + 2}: missing date or description; skipped.")
+            continue
+
+        amount_val = 0.0
+        if amount_col and not pd.isna(row[amount_col]):
+            raw_amount = str(row[amount_col]).replace("₦", "").replace("$", "").replace(",", "")
+            try:
+                amount_val = float(raw_amount)
+            except ValueError:
+                warnings.append(f"Row {index + 2}: invalid amount; skipped.")
+                continue
+        elif debit_col and not pd.isna(row[debit_col]):
+            try:
+                amount_val = -float(str(row[debit_col]).replace("₦", "").replace(",", ""))
+            except ValueError:
+                warnings.append(f"Row {index + 2}: invalid debit amount; skipped.")
+                continue
+        elif credit_col and not pd.isna(row[credit_col]):
+            try:
+                amount_val = float(str(row[credit_col]).replace("₦", "").replace(",", ""))
+            except ValueError:
+                warnings.append(f"Row {index + 2}: invalid credit amount; skipped.")
+                continue
+
+        if amount_val == 0.0:
+            warnings.append(f"Row {index + 2}: zero or missing amount; skipped.")
+            continue
+
+        try:
+            dt = pd.to_datetime(str(row[date_col]).strip(), dayfirst=True)
+            date_val = dt.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            warnings.append(f"Row {index + 2}: invalid date; skipped.")
+            continue
+
+        transactions.append({
+            "date": date_val,
+            "raw_description": str(row[desc_col]),
+            "amount": amount_val,
+        })
+
+    return transactions, warnings
+
+
 def parse_pdf_statement(file_obj):
     """
-    Extracts transactions from a PDF bank statement.
-    Strategy:
-    1. Try pdfplumber to get text (works for non-encrypted PDFs).
-    2. If the PDF is encrypted/password-protected, fall back to uploading the raw bytes
-       directly to the Gemini Files API, which can natively read owner-locked PDFs like
-       most Nigerian bank statements (GTBank, UBA, Access Bank, Zenith, etc.).
+    Extract transactions locally when possible, then use Gemini's Interactions API.
+    PDFs without extractable text are sent inline as a document, avoiding temporary
+    Gemini Files API resources and keeping model calls on the supported endpoint.
     """
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("NEXT_GEMINI_API_KEY")
     if not api_key:
@@ -112,7 +115,7 @@ def parse_pdf_statement(file_obj):
 
     # --- Strategy 1: Try pdfplumber text extraction ---
     text_content = ""
-    use_file_upload = False
+    use_inline_pdf = False
 
     try:
         # Read file bytes once so we can reuse them if pdfplumber fails
@@ -126,12 +129,10 @@ def parse_pdf_statement(file_obj):
                     text_content += extracted + "\n"
 
         if not text_content.strip():
-            # pdfplumber opened OK but extracted nothing — try Gemini with file upload
-            use_file_upload = True
+            use_inline_pdf = True
 
     except Exception:
-        # Most likely PDFPasswordIncorrect or another encryption error
-        use_file_upload = True
+        use_inline_pdf = True
 
     PROMPT_INSTRUCTIONS = """
 You are a precise data extraction AI processing a Nigerian bank statement.
@@ -146,36 +147,28 @@ Return ONLY a valid JSON array with no markdown formatting or extra explanation.
 """
 
     try:
-        if use_file_upload:
-            # --- Strategy 2: Upload raw PDF bytes to Gemini Files API ---
-            import tempfile
-
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp.write(file_bytes)
-                tmp_path = tmp.name
-
-            try:
-                uploaded_file = client.files.upload(
-                    file=tmp_path,
-                    config={"display_name": "bank_statement.pdf"}
-                )
-
-                response = client.models.generate_content(
-                    model=GEMINI_PDF_MODEL,
-                    contents=[uploaded_file, PROMPT_INSTRUCTIONS],
-                )
-            finally:
-                os.unlink(tmp_path)  # clean up temp file
-
+        if use_inline_pdf:
+            interaction_input = [
+                {
+                    "type": "document",
+                    "data": base64.b64encode(file_bytes).decode("ascii"),
+                    "mime_type": "application/pdf",
+                },
+                {"type": "text", "text": PROMPT_INSTRUCTIONS},
+            ]
         else:
-            # --- Strategy 1 continued: Send extracted text to Gemini ---
             prompt = f"{PROMPT_INSTRUCTIONS}\n\nRaw text:\n{text_content}"
-            response = client.models.generate_content(
-                model=GEMINI_PDF_MODEL,
-                contents=prompt,
-            )
+            interaction_input = [{"type": "text", "text": prompt}]
 
-        res_text = response.text.strip()
+        response = client.interactions.create(
+            model=GEMINI_PDF_MODEL,
+            input=interaction_input,
+            store=False,
+        )
+        res_text = response.output_text
+        if not res_text:
+            raise ValueError("Gemini returned an empty response for the PDF.")
+        res_text = res_text.strip()
         if res_text.startswith("```json"):
             res_text = res_text[7:]
         if res_text.startswith("```"):
@@ -185,6 +178,5 @@ Return ONLY a valid JSON array with no markdown formatting or extra explanation.
 
         transactions = json.loads(res_text.strip())
         return transactions
-
     except Exception as e:
         raise ValueError(f"Failed to extract PDF: {str(e)}")

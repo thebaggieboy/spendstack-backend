@@ -4,6 +4,7 @@ from rest_framework.permissions import IsAuthenticated
 from django.db.models import Sum, Count, Avg, Max, Min, Q, F
 from django.db.models.functions import TruncMonth, ExtractWeekDay
 from django.utils import timezone
+from billing.permissions import HasActiveProSubscription
 import calendar
 from collections import defaultdict
 from datetime import date
@@ -158,7 +159,7 @@ class MonthlyTrendView(APIView):
 
 
 class MonthlyComparisonView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveProSubscription]
 
     def get(self, request):
         today = timezone.localdate()

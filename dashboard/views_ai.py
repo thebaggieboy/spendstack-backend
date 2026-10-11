@@ -14,13 +14,14 @@ from rest_framework.permissions import IsAuthenticated
 from analysis.models import Statement
 from analysis.utils.advisor import generate_financial_advice
 from transactions.models import Transaction
+from billing.permissions import HasActiveProSubscription
 
 
 logger = logging.getLogger(__name__)
 
 
 class AIAdvisorView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasActiveProSubscription]
 
     def get(self, request):
         insights = generate_financial_advice(request.user.id)

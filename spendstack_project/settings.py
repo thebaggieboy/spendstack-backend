@@ -55,6 +55,8 @@ INSTALLED_APPS = [
     'analysis.apps.AnalysisConfig',
     'dashboard.apps.DashboardConfig',
     'savings.apps.SavingsConfig',
+    'billing.apps.BillingConfig',
+    'admin_analytics.apps.AdminAnalyticsConfig',
 ]
 
 MIDDLEWARE = [
@@ -170,6 +172,9 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
+    'DEFAULT_THROTTLE_RATES': {
+        'analytics_track': '120/hour',
+    },
 }
 
 import os
