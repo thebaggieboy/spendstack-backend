@@ -3,49 +3,6 @@
 import django.db.models.deletion
 from django.conf import settings
 from django.db import migrations, models
-import re
-
-
-TRANSFER_PATTERN = re.compile(
-    r"\bNIP\s*[/\- ]?\s*(?:TRF|TRANSFER)\b|\b(?:TRF|XFER)\s*[/:\-]|"
-    r"\b(?:TRANSFER|XFER|TRF)\s+(?:TO|FROM|BETWEEN|INTO|OUT\s+OF)\b|"
-    r"\b(?:MOBILE|INTERNAL|OWN\s+ACCOUNT|SELF|BANK|INTERBANK|INSTANT)\s+"
-    r"(?:FUND\s+)?TRANSFER\b",
-    re.IGNORECASE,
-)
-TRANSFER_FEE_PATTERN = re.compile(
-    r"\b(?:TRANSFER|TRF|XFER)\b.{0,24}\b(?:FEE|CHARGE|LEVY|VAT|DUTY)\b",
-    re.IGNORECASE,
-)
-
-
-def preserve_transaction_bases_and_mark_transfers(apps, schema_editor):
-    Transaction = apps.get_model("transactions", "Transaction")
-    Category = apps.get_model("transactions", "Category")
-
-    for item in Transaction.objects.select_related("category").iterator():
-        item.original_merchant_name = item.merchant_name
-        item.original_category_name = item.category.name if item.category_id else "Other"
-        text = item.raw_description or ""
-        item.is_transfer = bool(
-            TRANSFER_PATTERN.search(text) and not TRANSFER_FEE_PATTERN.search(text)
-        )
-        if item.is_transfer:
-            category, _ = Category.objects.get_or_create(
-                name="Transfers",
-                defaults={"color": "#8b5cf6", "is_system": True},
-            )
-            item.category_id = category.pk
-        item.save(update_fields=[
-            "original_merchant_name",
-            "original_category_name",
-            "is_transfer",
-            "category",
-        ])
-
-
-def noop_reverse(apps, schema_editor):
-    pass
 
 
 class Migration(migrations.Migration):
@@ -70,10 +27,6 @@ class Migration(migrations.Migration):
             model_name='transaction',
             name='original_merchant_name',
             field=models.CharField(blank=True, max_length=255),
-        ),
-        migrations.RunPython(
-            preserve_transaction_bases_and_mark_transfers,
-            noop_reverse,
         ),
         migrations.CreateModel(
             name='SpendingAlert',
