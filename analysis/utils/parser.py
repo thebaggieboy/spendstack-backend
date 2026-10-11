@@ -9,16 +9,20 @@ from google import genai
 GEMINI_PDF_MODEL = "gemini-3.8-flash"
 
 def parse_csv_statement(file_content):
+    transactions, _ = parse_csv_statement_detailed(file_content)
+    return transactions
+
+
+def parse_csv_statement_detailed(file_content):
     """
     Basic heuristic-based CSV parser.
     Assumes common bank structures (Date, Description, Amount).
+    Returns accepted rows alongside row-specific warnings.
     """
     try:
         df = pd.read_csv(io.StringIO(file_content.decode('utf-8')))
-        
-        # Super rudimentary mapping for MVP (would need robust column detection in prod)
-        # Attempt to find standard columns
-        col_names = [str(c).lower() for c in df.columns]
+        df.columns = [str(column).strip().lower() for column in df.columns]
+        col_names = list(df.columns)
         
         date_col = next((c for c in col_names if 'date' in c), None)
         desc_col = next((c for c in col_names if 'description' in c or 'name' in c or 'details' in c or 'remarks' in c), None)
@@ -35,8 +39,10 @@ def parse_csv_statement(file_content):
             raise ValueError("Could not auto-detect Amount or Debit/Credit columns.")
 
         transactions = []
+        warnings = []
         for index, row in df.iterrows():
             if pd.isna(row[date_col]) or pd.isna(row[desc_col]):
+                warnings.append(f"Row {index + 2}: missing date or description; skipped.")
                 continue
                 
             # Determine actual amount
@@ -46,6 +52,7 @@ def parse_csv_statement(file_content):
                 try:
                     amount_val = float(raw_amt)
                 except ValueError:
+                    warnings.append(f"Row {index + 2}: invalid amount; skipped.")
                     continue
             else:
                 # Handle split Debit / Credit
@@ -54,15 +61,18 @@ def parse_csv_statement(file_content):
                     try:
                         amount_val = -float(raw_debit)
                     except ValueError:
+                        warnings.append(f"Row {index + 2}: invalid debit amount; skipped.")
                         pass
                 elif credit_col and not pd.isna(row[credit_col]):
                     raw_credit = str(row[credit_col]).replace('₦', '').replace(',', '')
                     try:
                         amount_val = float(raw_credit)
                     except ValueError:
+                        warnings.append(f"Row {index + 2}: invalid credit amount; skipped.")
                         pass
                         
             if amount_val == 0.0:
+                warnings.append(f"Row {index + 2}: zero or missing amount; skipped.")
                 continue
 
             # Parse date safely (assuming Nigerian day-first format usually)
@@ -72,6 +82,7 @@ def parse_csv_statement(file_content):
                 dt = pd.to_datetime(raw_date, dayfirst=True)
                 date_val = dt.strftime('%Y-%m-%d')
             except Exception:
+                warnings.append(f"Row {index + 2}: invalid date; skipped.")
                 continue
 
             transactions.append({
@@ -80,7 +91,7 @@ def parse_csv_statement(file_content):
                 "amount": amount_val
             })
             
-        return transactions
+        return transactions, warnings
     except Exception as e:
         raise ValueError(f"Failed to parse CSV: {str(e)}")
 

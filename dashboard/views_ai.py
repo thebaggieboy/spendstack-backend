@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from django.db.models import Count, F, Max, Min, Q, Sum
 from django.shortcuts import get_object_or_404
 from google import genai
@@ -44,7 +45,7 @@ class StatementChatView(APIView):
             )
 
         statement_id = request.data.get("statement_id")
-        queryset = Transaction.objects.filter(user=request.user).select_related("category")
+        queryset = Transaction.objects.filter(user=request.user).select_related("category", "statement")
         statement_name = "All uploaded statements"
         if statement_id not in (None, ""):
             if not str(statement_id).isdigit():
@@ -98,12 +99,15 @@ class StatementChatView(APIView):
         recent_transactions = list(
             queryset.order_by("-date", "-id")
             .values(
+                "id",
                 "date",
                 "amount",
                 "merchant_name",
                 "raw_description",
                 "is_transfer",
                 "category__name",
+                "statement_id",
+                "statement__filename",
             )[:300]
         )
         context = {
@@ -128,12 +132,16 @@ class StatementChatView(APIView):
             ],
             "most_recent_transactions": [
                 {
+                    "source_id": f"TX-{item['id']}",
+                    "transaction_id": item["id"],
                     "date": item["date"].isoformat() if item["date"] else None,
                     "amount": str(item["amount"]),
                     "merchant": item["merchant_name"],
                     "description": item["raw_description"],
                     "category": item["category__name"] or "Uncategorized",
                     "is_transfer": item["is_transfer"],
+                    "statement_id": item["statement_id"],
+                    "statement": item["statement__filename"],
                 }
                 for item in recent_transactions
             ],
@@ -156,7 +164,9 @@ class StatementChatView(APIView):
             "(NGN). Exclude transfers from income and expense totals, but report transfers "
             "separately when asked. The transaction list may be truncated; say so when it "
             "affects your answer. Be concise and do not present tax or investment guidance "
-            "as professional advice.\n\n"
+            "as professional advice. When using an individual transaction as evidence, cite "
+            "its exact source token such as [TX-123]. Cite only tokens present in the "
+            "transaction list and never invent source IDs.\n\n"
             f"Statement scope: {statement_name}\n"
             f"Financial context JSON:\n{json.dumps(context, ensure_ascii=False)}\n\n"
             f"Recent conversation JSON:\n{json.dumps(safe_history, ensure_ascii=False)}\n\n"
@@ -180,4 +190,23 @@ class StatementChatView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        return Response({"answer": answer})
+        allowed_sources = {
+            item["id"]: {
+                "transaction_id": item["id"],
+                "source_id": f"TX-{item['id']}",
+                "statement_id": item["statement_id"],
+                "statement": item["statement__filename"],
+                "date": item["date"].isoformat() if item["date"] else None,
+                "merchant": item["merchant_name"] or item["raw_description"][:40],
+                "category": item["category__name"] or "Uncategorized",
+                "amount": str(item["amount"]),
+            }
+            for item in recent_transactions
+        }
+        cited_ids = {
+            int(match)
+            for match in re.findall(r"\[TX-(\d+)\]", answer)
+            if int(match) in allowed_sources
+        }
+        sources = [allowed_sources[source_id] for source_id in sorted(cited_ids)]
+        return Response({"answer": answer, "sources": sources})

@@ -1,9 +1,12 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from django.db.models import Sum, Count, Avg, Max, Min, Q
+from django.db.models import Sum, Count, Avg, Max, Min, Q, F
 from django.db.models.functions import TruncMonth, ExtractWeekDay
+from django.utils import timezone
+import calendar
 from collections import defaultdict
+from datetime import date
 from transactions.models import Transaction
 
 
@@ -152,3 +155,79 @@ class MonthlyTrendView(APIView):
             })
 
         return Response(data)
+
+
+class MonthlyComparisonView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        today = timezone.localdate()
+        current_start = today.replace(day=1)
+        previous_month = current_start.replace(day=1)
+        if previous_month.month == 1:
+            previous_month = previous_month.replace(year=previous_month.year - 1, month=12)
+        else:
+            previous_month = previous_month.replace(month=previous_month.month - 1)
+        previous_end = previous_month.replace(
+            day=min(today.day, calendar.monthrange(previous_month.year, previous_month.month)[1])
+        )
+
+        def summarize(start, end):
+            period_transactions = Transaction.objects.filter(
+                user=request.user,
+                is_transfer=False,
+                date__gte=start,
+                date__lte=end,
+            )
+            totals = period_transactions.aggregate(
+                income=Sum("amount", filter=Q(amount__gt=0)),
+                expenses=Sum("amount", filter=Q(amount__lt=0)),
+            )
+            categories = period_transactions.filter(amount__lt=0).values(
+                category_name=F("category__name")
+            ).annotate(total=Sum("amount"))
+            return (
+                float(abs(totals["expenses"] or 0)),
+                float(totals["income"] or 0),
+                {
+                    row["category_name"] or "Uncategorized": float(abs(row["total"] or 0))
+                    for row in categories
+                },
+            )
+
+        current_expenses, current_income, current_categories = summarize(current_start, today)
+        previous_expenses, previous_income, previous_categories = summarize(previous_month, previous_end)
+
+        def change(current, previous):
+            return {
+                "amount": round(current - previous, 2),
+                "percent": round((current - previous) / previous * 100, 1) if previous else None,
+            }
+
+        category_names = set(current_categories) | set(previous_categories)
+        category_comparison = [
+            {
+                "category": name,
+                "current": round(current_categories.get(name, 0), 2),
+                "previous": round(previous_categories.get(name, 0), 2),
+                "change": round(current_categories.get(name, 0) - previous_categories.get(name, 0), 2),
+            }
+            for name in category_names
+        ]
+        category_comparison.sort(key=lambda row: abs(row["change"]), reverse=True)
+
+        return Response({
+            "current_period": {"start": current_start.isoformat(), "end": today.isoformat()},
+            "previous_period": {"start": previous_month.isoformat(), "end": previous_end.isoformat()},
+            "expenses": {
+                "current": round(current_expenses, 2),
+                "previous": round(previous_expenses, 2),
+                "change": change(current_expenses, previous_expenses),
+            },
+            "income": {
+                "current": round(current_income, 2),
+                "previous": round(previous_income, 2),
+                "change": change(current_income, previous_income),
+            },
+            "categories": category_comparison[:5],
+        })
