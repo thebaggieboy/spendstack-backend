@@ -54,6 +54,7 @@ INSTALLED_APPS = [
     'transactions.apps.TransactionsConfig',
     'analysis.apps.AnalysisConfig',
     'dashboard.apps.DashboardConfig',
+    'savings.apps.SavingsConfig',
 ]
 
 MIDDLEWARE = [
@@ -179,3 +180,8 @@ SIMPLE_JWT = {
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'AUTHORIZATION_HEADER_TYPES': ('Bearer',),
 }
+
+SPENDSTACK_FRONTEND_URL = os.environ.get(
+    "SPENDSTACK_FRONTEND_URL",
+    "http://localhost:3000",
+).rstrip("/")

@@ -30,3 +30,33 @@ Statement uploads support a review-before-import flow:
 | `POST` | `/api/analysis/upload/` | Legacy direct-import endpoint; exact duplicate files are rejected |
 
 Imported statement files are fingerprinted with SHA-256 per user, so uploading the same bytes again returns HTTP 409. This is exact-file duplicate detection; files with different bytes are not deduplicated by transaction content. Chat answers may include `[TX-id]` references; the API returns validated source metadata for those IDs so the frontend can link back to the owning statement transaction.
+
+## Wallet, money locks, and scheduled payouts
+
+Set `PAYSTACK_SECRET_KEY` in the backend environment. The value must be a server-side Paystack secret key and must never be exposed to the frontend. Set `SPENDSTACK_FRONTEND_URL` to the deployed frontend origin so Paystack can return users to the wallet page. Apply migrations with `python manage.py migrate`.
+
+Authenticated endpoints:
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/savings/wallet/` | Read available/locked balances and recent ledger entries |
+| `POST` | `/api/savings/fund/initialize/` | Initialize a Paystack Checkout top-up |
+| `GET` | `/api/savings/fund/verify/?reference=...` | Verify a checkout payment and credit it once |
+| `GET, POST` | `/api/savings/locks/` | List locks or reserve available wallet funds until maturity |
+| `GET` | `/api/savings/bank-directory/` | List banks supported by Paystack |
+| `GET, POST` | `/api/savings/bank-accounts/` | List the user's verified recipients or verify/register one |
+| `GET, POST` | `/api/savings/budgets/` | List or create a spending budget |
+| `DELETE` | `/api/savings/budgets/{id}/` | Delete one of the signed-in user's budgets |
+| `GET` | `/api/savings/schedules/` | List the signed-in user's scheduled payouts |
+| `POST` | `/api/savings/schedules/{id}/payout/` | Start a due payout after explicit user confirmation |
+| `POST` | `/api/savings/webhooks/paystack/` | Receive signed Paystack charge and transfer events |
+
+Configure Paystack to send `charge.success`, `transfer.success`, `transfer.failed`, and `transfer.reversed` events to `https://<backend-host>/api/savings/webhooks/paystack/`. The webhook validates Paystack's HMAC-SHA512 signature; successful charges are independently verified with Paystack before wallet credit. A user's full locked amount remains reserved until a verified transfer-success event completes its payout. Failed transfers do not release the lock.
+
+To enable automatic payouts, schedule this command to run periodically (for example, every 5 minutes) in the deployment platform's cron service:
+
+```sh
+python manage.py process_due_payouts
+```
+
+The application ledger tracks user-attributed balances; it does not itself segregate or custody funds. Reconcile and segregate settlement funds through the configured regulated/custodial arrangement before enabling real-money production use. Test checkout and transfers with Paystack test credentials first. No yield or interest is calculated.
