@@ -83,15 +83,48 @@ class PdfStatementParserTests(SimpleTestCase):
             }],
         )
 
+    @patch("pypdfium2.PdfDocument")
     @patch("analysis.utils.parser.pdfplumber.open")
-    def test_scanned_pdf_returns_actionable_local_parsing_error(self, pdf_open):
+    def test_scanned_pdf_returns_actionable_local_parsing_error(self, pdf_open, pdfium_document):
         pdf = MagicMock()
         pdf.pages = [MagicMock()]
         pdf.pages[0].extract_text.return_value = None
         pdf_open.return_value.__enter__.return_value = pdf
+        pdfium_document.return_value.__len__.return_value = 0
 
         with self.assertRaisesMessage(ValueError, "no selectable text"):
             parse_pdf_statement(io.BytesIO(b"%PDF-test"))
+
+    @patch("pypdfium2.PdfDocument")
+    @patch("analysis.utils.parser.pdfplumber.open", side_effect=ValueError("missing Root"))
+    def test_pdfium_fallback_reads_text_when_pdfplumber_cannot_open_pdf(self, _pdf_open, pdf_document):
+        text_page = MagicMock()
+        text_page.get_text_range.return_value = (
+            "01/10/2026 POS purchase Corner Cafe 1,250.00 DR"
+        )
+        page = MagicMock()
+        page.get_textpage.return_value = text_page
+        document = MagicMock()
+        document.__len__.return_value = 1
+        document.__getitem__.return_value = page
+        pdf_document.return_value = document
+
+        transactions = parse_pdf_statement(io.BytesIO(b"%PDF-recoverable"))
+
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]["raw_description"], "POS purchase Corner Cafe")
+        self.assertEqual(transactions[0]["amount"], Decimal("-1250.00"))
+        text_page.close.assert_called_once()
+        page.close.assert_called_once()
+        document.close.assert_called_once()
+
+    @patch("pypdfium2.PdfDocument", side_effect=ValueError("missing Root"))
+    @patch("analysis.utils.parser.pdfplumber.open", side_effect=ValueError("missing Root"))
+    def test_invalid_pdf_gets_actionable_error_instead_of_library_exception(
+        self, _pdf_open, _pdfium_document
+    ):
+        with self.assertRaisesMessage(ValueError, "Download it again from your bank"):
+            parse_pdf_statement(io.BytesIO(b"not a pdf"))
 
     def test_unsigned_amount_column_uses_description_to_infer_debit_or_credit(self):
         transactions, warnings = parse_csv_statement_detailed(
@@ -149,6 +182,64 @@ class PdfStatementParserTests(SimpleTestCase):
         self.assertEqual(transactions[0]["amount"], Decimal("-100"))
         self.assertEqual(transactions[0]["source_sheet"], "Transactions")
 
+    def test_excel_parser_treats_dash_amount_placeholders_as_empty_cells(self):
+        workbook = io.BytesIO()
+        pd.DataFrame([
+            {
+                "Date": "2026-10-01",
+                "Description": "POS purchase",
+                "Debit": "--",
+                "Credit": "NGN 1,250.00 CR",
+            },
+            {
+                "Date": "2026-10-02",
+                "Description": "POS purchase",
+                "Debit": "₦ 2,500.00 DR",
+                "Credit": "--",
+            },
+        ]).to_excel(workbook, index=False)
+
+        transactions, warnings = parse_excel_statement_detailed(workbook.getvalue())
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            [transaction["amount"] for transaction in transactions],
+            [Decimal("1250.00"), Decimal("-2500.00")],
+        )
+
+    def test_opay_xlsx_layout_parses_debit_credit_dash_placeholders(self):
+        workbook = io.BytesIO()
+        with pd.ExcelWriter(workbook) as writer:
+            pd.DataFrame([
+                ["Wallet Account Statement"],
+                ["Account Name", "Example"],
+                ["Account Type", "Wallet Account"],
+                ["Opening Balance", "₦0.00", "Total Debit", "₦1,000.00"],
+                [None],
+                [
+                    "Trans. Date",
+                    "Value Date",
+                    "Description",
+                    "Debit(₦)",
+                    "Credit(₦)",
+                    "Balance After(₦)",
+                ],
+                ["11 Sep 2026 07:17:07", "11 Sep 2026", "Wallet credit", "--", "87,000.00", "87,000.00"],
+                ["11 Sep 2026 07:17:02", "11 Sep 2026", "Transfer to savings", "87,000.00", "--", "0.00"],
+            ]).to_excel(writer, sheet_name="Wallet Account Transactions", header=False, index=False)
+
+        transactions, warnings = parse_excel_statement_detailed(workbook.getvalue())
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            [transaction["amount"] for transaction in transactions],
+            [Decimal("87000.00"), Decimal("-87000.00")],
+        )
+        self.assertTrue(all(
+            transaction["source_sheet"] == "Wallet Account Transactions"
+            for transaction in transactions
+        ))
+
     def test_parser_preserves_all_rows_in_a_ten_thousand_row_csv(self):
         rows = ["Date,Description,Debit,Credit"]
         rows.extend(
@@ -173,6 +264,18 @@ class StatementPreviewApiTests(TestCase):
 
     def upload(self):
         return SimpleUploadedFile("january.csv", self.csv_content, content_type="text/csv")
+
+    def test_empty_pdf_upload_reports_that_the_uploaded_file_is_zero_bytes(self):
+        upload = SimpleUploadedFile("empty.pdf", b"", content_type="application/pdf")
+
+        response = self.client.post(
+            "/api/analysis/preview/",
+            {"file": upload},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("empty (0 bytes)", response.data["detail"])
 
     def test_xlsx_statement_preview_parses_debit_credit_and_categorizes_locally(self):
         workbook = io.BytesIO()

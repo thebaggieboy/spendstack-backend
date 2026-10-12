@@ -26,6 +26,11 @@ MAX_STATEMENT_SIZE = 10 * 1024 * 1024
 
 
 def _parse_statement_file(file_obj, content):
+    if not content:
+        raise ValueError(
+            "The uploaded file is empty (0 bytes), so no statement data was received. "
+            "Download the statement again and verify the file is non-empty before uploading."
+        )
     filename = os.path.basename(file_obj.name)
     extension = os.path.splitext(filename)[1].lower()
     warnings = []

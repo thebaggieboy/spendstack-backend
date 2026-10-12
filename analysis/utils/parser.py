@@ -356,15 +356,24 @@ def _parse_amount(value):
         amount = Decimal(str(value))
     else:
         raw = str(value).strip()
+        raw = re.sub(r"[\u00a0\u202f]", " ", raw).strip()
+        if re.fullmatch(r"[-\u2013\u2014\u2212]+", raw):
+            return None
+        raw = raw.replace("−", "-").replace("﹣", "-")
         indicator = re.search(r"\b(DR|DEBIT|CR|CREDIT)\s*$", raw, re.I)
         raw = re.sub(r"\b(?:DR|DEBIT|CR|CREDIT)\s*$", "", raw, flags=re.I).strip()
+        raw = re.sub(r"\b(?:NGN|NAIRA)\b", "", raw, flags=re.I)
         raw = re.sub(r"[₦$£€]", "", raw)
+        raw = re.sub(r"^N\s*(?=\d)", "", raw, flags=re.I).strip()
         negative = (
             (raw.startswith("(") and raw.endswith(")"))
             or raw.startswith("-")
+            or raw.endswith("-")
             or (indicator and indicator.group(1).casefold() in ("dr", "debit"))
         )
         raw = raw.strip("()").replace(" ", "")
+        if raw.endswith("-"):
+            raw = raw[:-1]
         if not re.fullmatch(r"[-+]?\d[\d.,]*", raw):
             raise InvalidOperation(f"Invalid amount: {value}")
         if "," in raw and "." in raw:
@@ -489,11 +498,12 @@ def _parse_pdf_text(text):
 
 def parse_pdf_statement_detailed(file_obj):
     """Extract searchable PDF tables/text locally and report rows that need review."""
+    file_bytes = file_obj.read()
+    table_transactions = []
+    table_warnings = []
+    extracted_pages = []
+    used_pdfium_fallback = False
     try:
-        file_bytes = file_obj.read()
-        table_transactions = []
-        table_warnings = []
-        extracted_pages = []
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page_number, page in enumerate(pdf.pages, start=1):
                 for table in page.extract_tables() or []:
@@ -514,14 +524,17 @@ def parse_pdf_statement_detailed(file_obj):
                 extracted = page.extract_text()
                 if extracted:
                     extracted_pages.append((page_number, extracted))
-    except Exception as exc:
-        raise ValueError(f"Failed to read PDF statement: {exc}") from exc
+    except Exception:
+        extracted_pages = _extract_pdfium_text(file_bytes)
+        used_pdfium_fallback = True
 
     if table_transactions:
         return table_transactions, table_warnings
+    if not extracted_pages and not used_pdfium_fallback:
+        extracted_pages = _extract_pdfium_text(file_bytes)
     if not extracted_pages:
         raise ValueError(
-            "This PDF has no selectable text. Upload a searchable PDF or a CSV/Excel statement."
+            "This PDF has no selectable text. It may be a scanned image. Upload a searchable PDF or export the statement as CSV/Excel."
         )
     transactions = []
     warnings = []
@@ -539,6 +552,36 @@ def parse_pdf_statement_detailed(file_obj):
             "Could not identify transaction rows in this PDF. Upload a CSV/Excel statement or check the PDF layout."
         )
     return transactions, warnings
+
+
+def _extract_pdfium_text(file_bytes):
+    """Fallback text extraction for PDFs whose structure pdfplumber cannot read."""
+    try:
+        import pypdfium2
+
+        document = pypdfium2.PdfDocument(file_bytes)
+        try:
+            extracted_pages = []
+            for page_number in range(len(document)):
+                page = document[page_number]
+                try:
+                    text_page = page.get_textpage()
+                    try:
+                        text = text_page.get_text_range()
+                    finally:
+                        text_page.close()
+                finally:
+                    page.close()
+                if text and text.strip():
+                    extracted_pages.append((page_number + 1, text))
+            return extracted_pages
+        finally:
+            document.close()
+    except Exception as exc:
+        raise ValueError(
+            "We couldn't open this PDF. It may be incomplete, damaged, password-protected, "
+            "or not a valid PDF. Download it again from your bank, or export the statement as CSV/Excel."
+        ) from exc
 
 
 def parse_pdf_statement(file_obj):
