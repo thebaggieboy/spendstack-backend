@@ -13,9 +13,9 @@ from rest_framework import status
 from .utils.parser import (
     parse_csv_statement_detailed,
     parse_excel_statement_detailed,
-    parse_pdf_statement,
+    parse_pdf_statement_detailed,
 )
-from .utils.ai_categorizer import categorize_transactions
+from .utils.categorizer import categorize_transactions
 from transactions.models import Transaction, Account, Category
 from .models import Statement, StatementPreview
 from transactions.models import TransactionRule
@@ -35,7 +35,7 @@ def _parse_statement_file(file_obj, content):
         raw_data, warnings = parse_excel_statement_detailed(content)
     elif extension == ".pdf":
         import io
-        raw_data = parse_pdf_statement(io.BytesIO(content))
+        raw_data, warnings = parse_pdf_statement_detailed(io.BytesIO(content))
     else:
         raise ValueError("Unsupported file format. Use CSV, Excel, or PDF.")
 
@@ -50,18 +50,36 @@ def _parse_statement_file(file_obj, content):
             amount = Decimal(str(tx["amount"]))
             if not amount.is_finite():
                 raise InvalidOperation
-            tx["amount"] = str(amount.quantize(Decimal("0.01")))
+            normalized_amount = amount.quantize(Decimal("0.01"))
+            if normalized_amount != amount:
+                warnings.append(
+                    f"Transaction {tx.get('source_row', index + 1)}: amount has more than two decimal places; not imported."
+                )
+                tx["_invalid"] = True
+            if abs(normalized_amount) >= Decimal("100000000"):
+                warnings.append(
+                    f"Transaction {tx.get('source_row', index + 1)}: amount exceeds the supported range; not imported."
+                )
+                tx["_invalid"] = True
+            tx["amount"] = str(normalized_amount)
         except (KeyError, TypeError, ValueError, InvalidOperation):
-            warnings.append(f"Transaction {index + 1}: invalid date or amount; skipped.")
+            warnings.append(
+                f"Transaction {tx.get('source_row', index + 1)}: invalid date or amount; not imported."
+            )
             tx["_invalid"] = True
         if not isinstance(tx.get("raw_description"), str) or not tx["raw_description"].strip():
-            warnings.append(f"Transaction {index + 1}: missing description; skipped.")
+            warnings.append(
+                f"Transaction {tx.get('source_row', index + 1)}: missing description; not imported."
+            )
             tx["_invalid"] = True
-        tx["raw_description"] = str(tx.get("raw_description", ""))[:500]
+        tx["raw_description"] = str(tx.get("raw_description", ""))
 
     raw_data = [tx for tx in raw_data if not tx.pop("_invalid", False)]
     if not raw_data:
-        raise ValueError("No valid transactions were found in this statement.")
+        details = " ".join(warnings[:5])
+        raise ValueError(
+            f"No valid transactions were found in this statement. {details}".strip()
+        )
     for index, tx in enumerate(raw_data):
         tx["original_index"] = index
     categorized_data = categorize_transactions(raw_data)
@@ -188,6 +206,9 @@ class StatementPreviewView(APIView):
                 "transactions": [
                     {
                         "index": index,
+                        "source_row": tx.get("source_row"),
+                        "source_sheet": tx.get("source_sheet"),
+                        "source_page": tx.get("source_page"),
                         "date": tx["date"],
                         "description": tx["raw_description"],
                         "merchant": tx.get("merchant_name", "Unknown"),
@@ -213,6 +234,17 @@ class StatementPreviewConfirmView(APIView):
         if preview.is_expired:
             preview.delete()
             return Response({"detail": "This preview has expired. Upload the statement again."}, status=status.HTTP_410_GONE)
+        if preview.warnings:
+            return Response(
+                {
+                    "detail": (
+                        "This preview contains rows that could not be parsed without risk of data loss. "
+                        "Correct the statement or upload a cleaner CSV/Excel export before importing."
+                    ),
+                    "warnings": preview.warnings,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if Statement.objects.filter(user=request.user, file_sha256=preview.file_sha256).exists():
             preview.delete()
             return Response({"detail": "This statement has already been uploaded."}, status=status.HTTP_409_CONFLICT)
@@ -269,7 +301,18 @@ class StatementUploadView(APIView):
             return Response({"detail": "This statement has already been uploaded."}, status=status.HTTP_409_CONFLICT)
 
         try:
-            categorized_data, _ = _parse_statement_file(file_obj, content)
+            categorized_data, warnings = _parse_statement_file(file_obj, content)
+            if warnings:
+                return Response(
+                    {
+                        "detail": (
+                            "This statement contains rows that could not be parsed without risk of data loss. "
+                            "Use the preview flow to review the warnings before importing."
+                        ),
+                        "warnings": warnings,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             with transaction.atomic():
                 statement, created_transactions = _create_statement(
                     request.user,

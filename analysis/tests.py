@@ -1,25 +1,33 @@
 import io
-import base64
 import os
-import unittest
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase
 from django.test import TestCase
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.utils import timezone
 from decimal import Decimal
 import pandas as pd
 from rest_framework.test import APIClient
 
 from .models import Statement
-from transactions.models import Transaction
+from transactions.models import Category, Transaction
 
-from .utils.parser import GEMINI_PDF_MODEL, parse_pdf_statement
+from .utils.parser import (
+    parse_csv_statement_detailed,
+    parse_excel_statement_detailed,
+    parse_pdf_statement,
+)
+from .utils.categorizer import categorize_transactions
+from .utils.advisor import generate_financial_advice
 
 
 def _make_test_pdf():
-    stream = b"BT /F1 14 Tf 20 100 Td (No transactions on this statement.) Tj ET\n"
+    stream = (
+        b"BT /F1 10 Tf 20 100 Td "
+        b"(01/10/2026 01/10/2026 POS/PUR/Corner Cafe 1,250.00 10,000.00 DR) Tj ET\n"
+    )
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -60,81 +68,97 @@ class PdfStatementParserTests(SimpleTestCase):
 
         with pdfplumber.open(io.BytesIO(_make_test_pdf())) as pdf:
             self.assertEqual(len(pdf.pages), 1)
-            self.assertIn("No transactions on this statement.", pdf.pages[0].extract_text())
+            self.assertIn("Corner Cafe", pdf.pages[0].extract_text())
 
-    @patch("analysis.utils.parser.genai.Client")
-    @patch("analysis.utils.parser.pdfplumber.open")
-    def test_text_extraction_uses_current_gemini_model(self, pdf_open, client_factory):
-        page = MagicMock()
-        page.extract_text.return_value = "Statement transactions"
-        pdf = MagicMock()
-        pdf.pages = [page]
-        pdf_open.return_value.__enter__.return_value = pdf
-        client_factory.return_value.interactions.create.return_value.output_text = "[]"
-
-        result = parse_pdf_statement(io.BytesIO(b"%PDF-test"))
-
-        self.assertEqual(result, [])
-        client_factory.return_value.interactions.create.assert_called_once()
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "", "NEXT_GEMINI_API_KEY": ""})
+    def test_searchable_pdf_is_parsed_locally_without_gemini_credentials(self):
         self.assertEqual(
-            client_factory.return_value.interactions.create.call_args.kwargs["model"],
-            GEMINI_PDF_MODEL,
-        )
-        self.assertEqual(
-            client_factory.return_value.interactions.create.call_args.kwargs["input"][0]["type"],
-            "text",
+            parse_pdf_statement(io.BytesIO(_make_test_pdf())),
+            [{
+                "date": "2026-10-01",
+                "raw_description": "POS/PUR/Corner Cafe",
+                "amount": Decimal("-1250.00"),
+                "source_row": 1,
+                "source_page": 1,
+            }],
         )
 
-    @patch("analysis.utils.parser.genai.Client")
     @patch("analysis.utils.parser.pdfplumber.open")
-    def test_scanned_pdf_is_sent_inline_through_interactions_api(self, pdf_open, client_factory):
+    def test_scanned_pdf_returns_actionable_local_parsing_error(self, pdf_open):
         pdf = MagicMock()
         pdf.pages = [MagicMock()]
         pdf.pages[0].extract_text.return_value = None
         pdf_open.return_value.__enter__.return_value = pdf
-        client = client_factory.return_value
-        client.interactions.create.return_value.output_text = "[]"
 
-        pdf_bytes = b"%PDF-test"
-        result = parse_pdf_statement(io.BytesIO(pdf_bytes))
+        with self.assertRaisesMessage(ValueError, "no selectable text"):
+            parse_pdf_statement(io.BytesIO(b"%PDF-test"))
 
-        self.assertEqual(result, [])
-        client.interactions.create.assert_called_once()
-        self.assertFalse(client.files.upload.called)
-        call_kwargs = client.interactions.create.call_args.kwargs
-        self.assertEqual(
-            call_kwargs["model"],
-            GEMINI_PDF_MODEL,
-        )
-        self.assertFalse(call_kwargs["store"])
-        document_input = call_kwargs["input"][0]
-        self.assertEqual(document_input["type"], "document")
-        self.assertEqual(document_input["mime_type"], "application/pdf")
-        self.assertEqual(
-            base64.b64decode(document_input["data"]),
-            pdf_bytes,
+    def test_unsigned_amount_column_uses_description_to_infer_debit_or_credit(self):
+        transactions, warnings = parse_csv_statement_detailed(
+            b"Date,Description,Amount\n"
+            b"2026-01-10,POS purchase at Corner Cafe,1250.00\n"
+            b"2026-01-11,Salary credit,50000.00\n"
         )
 
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            [transaction["amount"] for transaction in transactions],
+            [Decimal("-1250.00"), Decimal("50000.00")],
+        )
 
-@unittest.skipUnless(
-    os.environ.get("RUN_GEMINI_INTEGRATION_TESTS") == "1"
-    and (os.environ.get("GEMINI_API_KEY") or os.environ.get("NEXT_GEMINI_API_KEY")),
-    "Set RUN_GEMINI_INTEGRATION_TESTS=1 and GEMINI_API_KEY to run the live Gemini test.",
-)
-class LiveGeminiPdfIntegrationTests(SimpleTestCase):
-    @patch(
-        "analysis.utils.parser.pdfplumber.open",
-        side_effect=RuntimeError("Force the native PDF document request."),
-    )
-    def test_live_interactions_api_extracts_valid_transaction_array(self, _pdf_open):
-        transactions = parse_pdf_statement(io.BytesIO(_make_test_pdf()))
+    def test_csv_finds_headers_after_preamble_and_parses_european_amounts(self):
+        transactions, warnings = parse_csv_statement_detailed(
+            b"Bank statement export\n"
+            b"Transaction Date;Narration;Debit Amount;Credit Amount\n"
+            b"2026-10-01;Cafe purchase;1.234,50;\n"
+            b"2026-10-02;Salary credit;;50.000,25\n"
+        )
 
-        self.assertIsInstance(transactions, list)
-        for transaction in transactions:
-            self.assertIsInstance(transaction, dict)
-            self.assertRegex(transaction.get("date", ""), r"^\d{4}-\d{2}-\d{2}$")
-            self.assertIsInstance(transaction.get("raw_description"), str)
-            self.assertIsInstance(transaction.get("amount"), (int, float))
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            [(item["date"], item["amount"], item["source_row"]) for item in transactions],
+            [
+                ("2026-10-01", Decimal("-1234.50"), 3),
+                ("2026-10-02", Decimal("50000.25"), 4),
+            ],
+        )
+
+    def test_csv_ambiguous_unsigned_amount_is_reported_not_guessed(self):
+        transactions, warnings = parse_csv_statement_detailed(
+            b"Date,Description,Amount\n2026-01-10,Local Grocer,1250.00\n"
+        )
+
+        self.assertEqual(transactions[0]["amount"], Decimal("1250.00"))
+        self.assertIn("amount sign is ambiguous", warnings[0])
+        self.assertIn("Row 2", warnings[0])
+
+    def test_excel_parser_reads_transaction_tables_on_each_sheet(self):
+        workbook = io.BytesIO()
+        with pd.ExcelWriter(workbook) as writer:
+            pd.DataFrame([["Account summary"], ["Opening balance", 1000]]).to_excel(
+                writer, sheet_name="Summary", header=False, index=False
+            )
+            pd.DataFrame([
+                {"Date": "2026-10-01", "Description": "POS purchase", "Debit": 100},
+            ]).to_excel(writer, sheet_name="Transactions", index=False)
+
+        transactions, warnings = parse_excel_statement_detailed(workbook.getvalue())
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]["amount"], Decimal("-100"))
+        self.assertEqual(transactions[0]["source_sheet"], "Transactions")
+
+    def test_parser_preserves_all_rows_in_a_ten_thousand_row_csv(self):
+        rows = ["Date,Description,Debit,Credit"]
+        rows.extend(
+            f"2026-01-{index % 28 + 1:02d},POS purchase {index},{index + 1},"
+            for index in range(10000)
+        )
+        transactions, warnings = parse_csv_statement_detailed("\n".join(rows).encode())
+
+        self.assertEqual(len(transactions), 10000)
+        self.assertEqual(warnings, [])
 
 
 class StatementPreviewApiTests(TestCase):
@@ -150,12 +174,11 @@ class StatementPreviewApiTests(TestCase):
     def upload(self):
         return SimpleUploadedFile("january.csv", self.csv_content, content_type="text/csv")
 
-    @patch("analysis.views.categorize_transactions")
-    def test_xlsx_statement_preview_parses_debit_and_credit_columns(self, categorize):
+    def test_xlsx_statement_preview_parses_debit_credit_and_categorizes_locally(self):
         workbook = io.BytesIO()
         pd.DataFrame(
             [
-                {"Date": "2026-01-10", "Description": "Card purchase", "Debit": 1250.5, "Credit": None},
+                {"Date": "2026-01-10", "Description": "POS/PUR/Corner Cafe", "Debit": 1250.5, "Credit": None},
                 {"Date": "2026-01-11", "Description": "Salary", "Debit": None, "Credit": 50000},
             ]
         ).to_excel(workbook, index=False)
@@ -164,11 +187,6 @@ class StatementPreviewApiTests(TestCase):
             workbook.getvalue(),
             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        categorize.side_effect = lambda transactions: [
-            {**tx, "merchant_name": tx["raw_description"], "category_name": "Other"}
-            for tx in transactions
-        ]
-
         response = self.client.post(
             "/api/analysis/preview/",
             {"file": upload},
@@ -180,14 +198,12 @@ class StatementPreviewApiTests(TestCase):
             [transaction["amount"] for transaction in response.data["transactions"]],
             ["-1250.50", "50000.00"],
         )
+        self.assertEqual(
+            [transaction["category"] for transaction in response.data["transactions"]],
+            ["Food & Dining", "Salary"],
+        )
 
-    @patch("analysis.views.categorize_transactions")
-    def test_preview_requires_confirmation_before_creating_statement_transactions(self, categorize):
-        categorize.side_effect = lambda transactions: [
-            {**tx, "merchant_name": "Corner Store", "category_name": "Food & Dining"}
-            for tx in transactions
-        ]
-
+    def test_preview_requires_confirmation_before_creating_statement_transactions(self):
         response = self.client.post("/api/analysis/preview/", {"file": self.upload()}, format="multipart")
 
         self.assertEqual(response.status_code, 201, response.data)
@@ -206,12 +222,7 @@ class StatementPreviewApiTests(TestCase):
         self.assertEqual(Transaction.objects.count(), 1)
         self.assertEqual(Transaction.objects.get().amount, Decimal("-1250.50"))
 
-    @patch("analysis.views.categorize_transactions")
-    def test_preview_detects_already_imported_file(self, categorize):
-        categorize.side_effect = lambda transactions: [
-            {**tx, "merchant_name": "Corner Store", "category_name": "Food & Dining"}
-            for tx in transactions
-        ]
+    def test_preview_detects_already_imported_file(self):
         preview = self.client.post(
             "/api/analysis/preview/",
             {"file": self.upload()},
@@ -232,3 +243,96 @@ class StatementPreviewApiTests(TestCase):
 
         self.assertEqual(duplicate.status_code, 409)
         self.assertIn("already been uploaded", duplicate.data["detail"])
+
+    def test_preview_blocks_import_if_any_transaction_row_is_ambiguous(self):
+        content = (
+            b"Date,Description,Amount\n"
+            b"2026-01-10,POS purchase at Cafe,-1250.50\n"
+            b"2026-01-11,Local Grocer,450.00\n"
+        )
+        upload = SimpleUploadedFile("ambiguous.csv", content, content_type="text/csv")
+
+        preview = self.client.post("/api/analysis/preview/", {"file": upload}, format="multipart")
+
+        self.assertEqual(preview.status_code, 201, preview.data)
+        self.assertEqual(len(preview.data["transactions"]), 2)
+        self.assertIn("amount sign is ambiguous", preview.data["warnings"][0])
+        confirmation = self.client.post(
+            f"/api/analysis/preview/{preview.data['preview_id']}/confirm/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(confirmation.status_code, 400)
+        self.assertEqual(Statement.objects.count(), 0)
+        self.assertEqual(Transaction.objects.count(), 0)
+
+    def test_import_preserves_descriptions_longer_than_old_500_character_limit(self):
+        description = ("POS purchase at " + ("Long Merchant " * 50)).rstrip()
+        content = f"Date,Description,Amount\n2026-01-10,{description},-1250.50\n".encode()
+        upload = SimpleUploadedFile("long.csv", content, content_type="text/csv")
+
+        preview = self.client.post("/api/analysis/preview/", {"file": upload}, format="multipart")
+        self.assertEqual(preview.status_code, 201, preview.data)
+        confirmation = self.client.post(
+            f"/api/analysis/preview/{preview.data['preview_id']}/confirm/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(confirmation.status_code, 201, confirmation.data)
+        transaction = Transaction.objects.get()
+        self.assertEqual(transaction.raw_description, description)
+
+
+class StatementCategorizerTests(SimpleTestCase):
+    def test_categorizes_using_description_and_signed_amount(self):
+        transactions = [
+            {"raw_description": "NIP/TRF/123456/JOHN DOE", "amount": "-8000.00"},
+            {"raw_description": "POS/PUR/ABC SUPERMARKET", "amount": "-2500.00"},
+            {"raw_description": "Monthly salary", "amount": "250000.00"},
+            {"raw_description": "SMS Alert Fee", "amount": "-10.00"},
+        ]
+
+        result = categorize_transactions(transactions)
+
+        self.assertEqual(
+            [transaction["category_name"] for transaction in result],
+            ["Transfers", "Food & Dining", "Salary", "Bank Charges"],
+        )
+        self.assertEqual(
+            [transaction["merchant_name"] for transaction in result],
+            ["JOHN DOE", "ABC SUPERMARKET", "Monthly salary", "SMS Alert Fee"],
+        )
+
+
+class LocalFinancialInsightTests(TestCase):
+    def test_dashboard_insights_use_recent_spending_without_gemini_credentials(self):
+        user = get_user_model().objects.create_user(
+            email="local-insights@example.com",
+            password="test-password",
+        )
+        category = Category.objects.create(name="Local insight dining")
+        Transaction.objects.create(
+            user=user,
+            date=timezone.localdate(),
+            amount=Decimal("-1250.00"),
+            merchant_name="Local Cafe",
+            raw_description="Cafe purchase",
+            category=category,
+        )
+        Transaction.objects.create(
+            user=user,
+            date=timezone.localdate(),
+            amount=Decimal("-9000.00"),
+            merchant_name="Own account",
+            raw_description="NIP transfer",
+            is_transfer=True,
+        )
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "NEXT_GEMINI_API_KEY": ""}):
+            insights = generate_financial_advice(user.id)
+
+        self.assertEqual(len(insights), 1)
+        self.assertEqual(insights[0]["title"], "Spending in Local insight dining")
+        self.assertIn("₦1,250.00", insights[0]["message"])

@@ -34,7 +34,7 @@ class Transaction(models.Model):
     # Convention: negative for expense, positive for income
     
     merchant_name = models.CharField(max_length=255, blank=True)
-    raw_description = models.CharField(max_length=500)
+    raw_description = models.TextField()
     original_merchant_name = models.CharField(max_length=255, blank=True)
     original_category_name = models.CharField(max_length=100, blank=True)
     is_transfer = models.BooleanField(default=False, db_index=True)
