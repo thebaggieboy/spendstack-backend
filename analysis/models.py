@@ -6,6 +6,7 @@ class Statement(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='statements')
     filename = models.CharField(max_length=255)
     file_sha256 = models.CharField(max_length=64, null=True, blank=True)
+    summary_data = models.JSONField(default=dict, blank=True)
     upload_date = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -29,6 +30,7 @@ class StatementPreview(models.Model):
     filename = models.CharField(max_length=255)
     file_sha256 = models.CharField(max_length=64)
     transactions = models.JSONField()
+    summary_data = models.JSONField(default=dict, blank=True)
     warnings = models.JSONField(default=list)
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()

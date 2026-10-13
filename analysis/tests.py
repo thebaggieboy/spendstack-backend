@@ -1,5 +1,6 @@
 import io
 import os
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase
@@ -18,9 +19,11 @@ from .utils.parser import (
     parse_csv_statement_detailed,
     parse_excel_statement_detailed,
     parse_pdf_statement,
+    extract_statement_summary,
 )
 from .utils.categorizer import categorize_transactions
 from .utils.advisor import generate_financial_advice
+from .views import _statement_reconciliation
 
 
 def _make_test_pdf():
@@ -63,6 +66,64 @@ def _make_test_pdf():
 
 
 class PdfStatementParserTests(SimpleTestCase):
+    def test_csv_extracts_explicit_statement_totals_and_balances(self):
+        summary = extract_statement_summary(
+            b"Opening Balance,1000.00\nTotal Credits,500.00 CR\nTotal Debits,200.00 DR\nClosing Balance,1300.00\n",
+            "statement.csv",
+        )
+
+        self.assertEqual(summary, {
+            "opening_balance": "1000.00",
+            "closing_balance": "1300.00",
+            "total_credits": "500.00",
+            "total_debits": "200.00",
+        })
+
+    @patch("analysis.utils.parser.pdfplumber.open")
+    def test_pdf_extracts_explicit_statement_summary(self, pdf_open):
+        page = MagicMock()
+        page.extract_text.return_value = (
+            "Opening Balance 1,000.00\nTotal Credits 500.00\n"
+            "Total Debits 200.00\nClosing Balance 1,300.00"
+        )
+        pdf_open.return_value.__enter__.return_value.pages = [page]
+
+        summary = extract_statement_summary(b"%PDF-summary", "statement.pdf")
+
+        self.assertEqual(summary, {
+            "opening_balance": "1000.00",
+            "closing_balance": "1300.00",
+            "total_credits": "500.00",
+            "total_debits": "200.00",
+        })
+
+    def test_csv_marks_conflicting_statement_summary_values_as_ambiguous(self):
+        summary = extract_statement_summary(
+            b"Total Credits,500.00\nTotal Credits,600.00\n",
+            "statement.csv",
+        )
+
+        self.assertEqual(summary, {"ambiguous_fields": ["total_credits"]})
+
+    def test_excel_extracts_labelled_statement_summary(self):
+        workbook = io.BytesIO()
+        pd.DataFrame([
+            ["Opening Balance", 1000],
+            ["Total Credits", 500],
+            ["Total Debits", 200],
+            ["Closing Balance", 1300],
+        ]).to_excel(workbook, header=False, index=False)
+
+        summary = extract_statement_summary(workbook.getvalue(), "statement.xlsx")
+
+        self.assertEqual(summary, {
+            "opening_balance": "1000.00",
+            "closing_balance": "1300.00",
+            "total_credits": "500.00",
+            "total_debits": "200.00",
+        })
+
+
     def test_integration_fixture_is_a_valid_readable_pdf(self):
         import pdfplumber
 
@@ -252,6 +313,25 @@ class PdfStatementParserTests(SimpleTestCase):
         self.assertEqual(warnings, [])
 
 
+class StatementReconciliationTests(SimpleTestCase):
+    def test_printed_summary_mismatch_is_flagged_without_replacing_row_totals(self):
+        reconciliation = _statement_reconciliation(
+            {
+                "total_credits": "500.00",
+                "total_debits": "250.00",
+                "opening_balance": "1000.00",
+                "closing_balance": "1250.00",
+            },
+            Decimal("500.00"),
+            Decimal("-200.00"),
+        )
+
+        self.assertEqual(reconciliation["status"], "mismatch")
+        self.assertEqual(reconciliation["checks"]["total_debits"]["from_transactions"], 200.0)
+        self.assertEqual(reconciliation["checks"]["total_debits"]["reported"], 250.0)
+        self.assertEqual(reconciliation["balance_movement"]["status"], "mismatch")
+
+
 class StatementPreviewApiTests(TestCase):
     def setUp(self):
         self.user = get_user_model().objects.create_user(
@@ -264,6 +344,34 @@ class StatementPreviewApiTests(TestCase):
 
     def upload(self):
         return SimpleUploadedFile("january.csv", self.csv_content, content_type="text/csv")
+
+    def test_statement_list_includes_first_and_last_transaction_dates(self):
+        statement = Statement.objects.create(user=self.user, filename="period.csv")
+        Transaction.objects.create(
+            user=self.user,
+            statement=statement,
+            date=date(2025, 12, 31),
+            amount=Decimal("-100.00"),
+            raw_description="December purchase",
+        )
+        Transaction.objects.create(
+            user=self.user,
+            statement=statement,
+            date=date(2026, 1, 2),
+            amount=Decimal("-50.00"),
+            raw_description="January purchase",
+        )
+        empty_statement = Statement.objects.create(user=self.user, filename="empty.csv")
+
+        response = self.client.get("/api/analysis/statements/")
+
+        self.assertEqual(response.status_code, 200)
+        by_filename = {item["filename"]: item for item in response.data}
+        self.assertEqual(by_filename["period.csv"]["transaction_count"], 2)
+        self.assertEqual(by_filename["period.csv"]["period_start"], "2025-12-31")
+        self.assertEqual(by_filename["period.csv"]["period_end"], "2026-01-02")
+        self.assertIsNone(by_filename[empty_statement.filename]["period_start"])
+        self.assertIsNone(by_filename[empty_statement.filename]["period_end"])
 
     def test_empty_pdf_upload_reports_that_the_uploaded_file_is_zero_bytes(self):
         upload = SimpleUploadedFile("empty.pdf", b"", content_type="application/pdf")
@@ -324,6 +432,55 @@ class StatementPreviewApiTests(TestCase):
         self.assertEqual(Statement.objects.count(), 1)
         self.assertEqual(Transaction.objects.count(), 1)
         self.assertEqual(Transaction.objects.get().amount, Decimal("-1250.50"))
+
+    def test_import_persists_summary_and_reconciliation_compares_all_posted_rows(self):
+        content = (
+            b"Date,Description,Debit,Credit\n"
+            b"Opening Balance,1000.00,,\n"
+            b"2026-01-10,Transfer to savings,200.00,\n"
+            b"2026-01-11,Salary,,500.00\n"
+            b"Total Credits,500.00,,\n"
+            b"Total Debits,200.00,,\n"
+            b"Closing Balance,1300.00,,\n"
+        )
+        upload = SimpleUploadedFile("balances.csv", content, content_type="text/csv")
+        preview = self.client.post("/api/analysis/preview/", {"file": upload}, format="multipart")
+        self.assertEqual(preview.status_code, 201, preview.data)
+        self.assertEqual(preview.data["statement_summary"]["opening_balance"], "1000.00")
+
+        confirmation = self.client.post(
+            f"/api/analysis/preview/{preview.data['preview_id']}/confirm/",
+            {},
+            format="json",
+        )
+        self.assertEqual(confirmation.status_code, 201, confirmation.data)
+        statement = Statement.objects.get()
+        self.assertEqual(statement.summary_data["closing_balance"], "1300.00")
+
+        detail = self.client.get(f"/api/analysis/statements/{statement.id}/")
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(detail.data["stats"]["total_credits"], 500.0)
+        self.assertEqual(detail.data["stats"]["total_expenses"], 200.0)
+        self.assertEqual(detail.data["stats"]["highest_daily_spend"], 0.0)
+        self.assertEqual(detail.data["statement_reconciliation"]["status"], "matched")
+
+    def test_legacy_direct_upload_persists_statement_summary(self):
+        content = (
+            b"Date,Description,Debit,Credit\n"
+            b"Opening Balance,1000.00,,\n"
+            b"2026-01-10,POS purchase,100.00,\n"
+            b"Total Credits,0.00,,\n"
+            b"Total Debits,100.00,,\n"
+            b"Closing Balance,900.00,,\n"
+        )
+        upload = SimpleUploadedFile("legacy.csv", content, content_type="text/csv")
+
+        response = self.client.post("/api/analysis/upload/", {"file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 201, response.data)
+        statement = Statement.objects.get()
+        self.assertEqual(statement.summary_data["opening_balance"], "1000.00")
+        self.assertEqual(statement.summary_data["closing_balance"], "900.00")
 
     def test_preview_detects_already_imported_file(self):
         preview = self.client.post(
@@ -386,6 +543,37 @@ class StatementPreviewApiTests(TestCase):
         self.assertEqual(confirmation.status_code, 201, confirmation.data)
         transaction = Transaction.objects.get()
         self.assertEqual(transaction.raw_description, description)
+
+    def test_confirm_import_bulk_persists_large_statement_without_losing_rows(self):
+        row_count = 1001
+        rows = ["Date,Description,Debit,Credit"]
+        rows.extend(
+            f"2026-01-{index % 28 + 1:02d},POS purchase {index},125.50,"
+            for index in range(row_count)
+        )
+        upload = SimpleUploadedFile(
+            "large-statement.csv",
+            "\n".join(rows).encode(),
+            content_type="text/csv",
+        )
+
+        preview = self.client.post(
+            "/api/analysis/preview/",
+            {"file": upload},
+            format="multipart",
+        )
+        self.assertEqual(preview.status_code, 201, preview.data)
+        self.assertEqual(len(preview.data["transactions"]), row_count)
+
+        confirmation = self.client.post(
+            f"/api/analysis/preview/{preview.data['preview_id']}/confirm/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(confirmation.status_code, 201, confirmation.data)
+        self.assertEqual(confirmation.data["transaction_count"], row_count)
+        self.assertEqual(Transaction.objects.count(), row_count)
 
 
 class StatementCategorizerTests(SimpleTestCase):

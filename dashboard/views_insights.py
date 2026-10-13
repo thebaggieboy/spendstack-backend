@@ -1,14 +1,24 @@
+from decimal import Decimal, ROUND_HALF_UP
+from datetime import timedelta
+
+from django.db.models import Sum, Count, Avg, Min, Max, Q, F
+from django.db.models.functions import TruncMonth, ExtractWeekDay
+from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from django.db.models import Sum, Count, Avg, Max, Min, Q, F
-from django.db.models.functions import TruncMonth, ExtractWeekDay
-from django.utils import timezone
-from billing.permissions import HasActiveProSubscription
-import calendar
 from collections import defaultdict
-from datetime import date
+import calendar
 from transactions.models import Transaction
+from .views import confirmed_non_transfer_transactions
+
+
+CENT = Decimal("0.01")
+TENTH = Decimal("0.1")
+
+
+def _round_decimal(value, quantum):
+    return value.quantize(quantum, rounding=ROUND_HALF_UP)
 
 
 WEEKDAY_NAMES = {
@@ -37,29 +47,52 @@ class SpendingInsightsView(APIView):
 
     def get(self, request):
         user_id = request.user.id
-        txs = Transaction.objects.filter(user_id=user_id, is_transfer=False)
-
-        if not txs.exists():
-            return Response({})
+        all_confirmed = Transaction.objects.filter(user_id=user_id, is_pending=False)
+        txs = confirmed_non_transfer_transactions(user_id)
+        period = request.query_params.get("period", "all")
+        today = timezone.localdate()
+        period_starts = {
+            "month": today.replace(day=1),
+            "90days": today - timedelta(days=89),
+            "year": today.replace(month=1, day=1),
+        }
+        if period not in {"all", *period_starts}:
+            return Response(
+                {"detail": "Choose a valid insights period."},
+                status=400,
+            )
+        if period in period_starts:
+            txs = txs.filter(date__gte=period_starts[period], date__lte=today)
+            all_confirmed = all_confirmed.filter(
+                date__gte=period_starts[period],
+                date__lte=today,
+            )
 
         expense_qs = txs.filter(amount__lt=0)
         income_qs = txs.filter(amount__gt=0)
 
         # ── Basic counts ────────────────────────────────────────────────────
-        total_txn_count = txs.count()
         expense_txn_count = expense_qs.count()
         income_txn_count = income_qs.count()
+        total_txn_count = expense_txn_count + income_txn_count
 
         # ── Avg daily spend ─────────────────────────────────────────────────
         # Group expenses by date → sum per day → average of those sums
-        daily = defaultdict(float)
+        daily = defaultdict(lambda: Decimal("0.00"))
         for tx in expense_qs.values('date', 'amount'):
-            daily[tx['date']] += float(abs(tx['amount']))
-        avg_daily_spend = (sum(daily.values()) / len(daily)) if daily else 0
+            daily[tx['date']] += abs(tx['amount'])
+        avg_daily_spend = (
+            sum(daily.values(), Decimal("0.00")) / len(daily)
+            if daily
+            else Decimal("0.00")
+        )
 
         # ── Avg single transaction value ─────────────────────────────────────
         avg_txn_agg = expense_qs.aggregate(avg=Avg('amount'))
-        avg_transaction_value = float(abs(avg_txn_agg['avg'])) if avg_txn_agg['avg'] else 0
+        avg_transaction_value = abs(avg_txn_agg['avg']) if avg_txn_agg['avg'] else Decimal("0.00")
+        total_expenses = abs(
+            expense_qs.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        )
 
         # ── Busiest day of week ─────────────────────────────────────────────
         by_weekday = (
@@ -67,7 +100,7 @@ class SpendingInsightsView(APIView):
             .annotate(wd=ExtractWeekDay('date'))
             .values('wd')
             .annotate(total=Sum('amount'))
-            .order_by('total')  # most negative = biggest spend
+            .order_by('total', 'wd')
         )
         busiest_spend_day = None
         if by_weekday:
@@ -76,13 +109,47 @@ class SpendingInsightsView(APIView):
 
         # ── Largest single expense ───────────────────────────────────────────
         largest_tx = expense_qs.order_by('amount').first()
-        largest_expense = 0
+        largest_expense = Decimal("0.00")
         largest_expense_name = None
         largest_expense_date = None
         if largest_tx:
-            largest_expense = float(abs(largest_tx.amount))
+            largest_expense = abs(largest_tx.amount)
             largest_expense_name = largest_tx.merchant_name or largest_tx.raw_description[:40]
             largest_expense_date = largest_tx.date.strftime('%b %d, %Y')
+
+        top_category_row = (
+            expense_qs.values(name=F("category__name"))
+            .annotate(total=Sum("amount"))
+            .order_by("total", "name")
+            .first()
+        )
+        top_category = (
+            top_category_row["name"] or "Uncategorized"
+            if top_category_row else None
+        )
+        top_category_amount = (
+            abs(top_category_row["total"])
+            if top_category_row else Decimal("0.00")
+        )
+        top_category_share = (
+            top_category_amount / total_expenses * Decimal("100")
+            if total_expenses else Decimal("0.0")
+        )
+
+        top_recipient_row = (
+            all_confirmed.filter(is_transfer=True, amount__lt=0)
+            .exclude(merchant_name="")
+            .values("merchant_name")
+            .annotate(count=Count("id"), total=Sum("amount"))
+            .order_by("-count", "total", "merchant_name")
+            .first()
+        )
+        top_recipient = top_recipient_row["merchant_name"] if top_recipient_row else None
+        top_recipient_count = top_recipient_row["count"] if top_recipient_row else 0
+        top_recipient_amount = (
+            abs(top_recipient_row["total"])
+            if top_recipient_row else Decimal("0.00")
+        )
 
         # ── Unique merchants ────────────────────────────────────────────────
         unique_merchants = (
@@ -94,19 +161,22 @@ class SpendingInsightsView(APIView):
         )
 
         # ── No-spend days ────────────────────────────────────────────────────
-        date_range = txs.aggregate(first=Min('date'), last=Max('date'))
+        date_range = txs.exclude(amount=0).aggregate(first=Min('date'), last=Max('date'))
         no_spend_days = 0
         if date_range['first'] and date_range['last']:
-            from datetime import timedelta
             total_days = (date_range['last'] - date_range['first']).days + 1
             days_with_spend = len(daily)
             no_spend_days = max(0, total_days - days_with_spend)
 
         return Response({
-            'avg_daily_spend': round(avg_daily_spend, 2),
-            'avg_transaction_value': round(avg_transaction_value, 2),
+            'has_data': total_txn_count > 0 or top_recipient_count > 0,
+            'period': period,
+            'period_start': period_starts.get(period).isoformat() if period in period_starts else None,
+            'period_end': today.isoformat() if period in period_starts else None,
+            'avg_daily_spend': float(_round_decimal(avg_daily_spend, CENT)),
+            'avg_transaction_value': float(_round_decimal(avg_transaction_value, CENT)),
             'busiest_spend_day': busiest_spend_day,
-            'largest_expense': round(largest_expense, 2),
+            'largest_expense': float(_round_decimal(largest_expense, CENT)),
             'largest_expense_name': largest_expense_name,
             'largest_expense_date': largest_expense_date,
             'total_txn_count': total_txn_count,
@@ -114,6 +184,12 @@ class SpendingInsightsView(APIView):
             'expense_txn_count': expense_txn_count,
             'unique_merchants': unique_merchants,
             'no_spend_days': no_spend_days,
+            'top_category': top_category,
+            'top_category_amount': float(_round_decimal(top_category_amount, CENT)),
+            'top_category_share_percent': float(_round_decimal(top_category_share, TENTH)),
+            'top_recipient': top_recipient,
+            'top_recipient_transfer_count': top_recipient_count,
+            'top_recipient_transfer_amount': float(_round_decimal(top_recipient_amount, CENT)),
         })
 
 
@@ -128,7 +204,7 @@ class MonthlyTrendView(APIView):
 
     def get(self, request):
         user_id = request.user.id
-        txs = Transaction.objects.filter(user_id=user_id, is_transfer=False)
+        txs = confirmed_non_transfer_transactions(user_id)
 
         if not txs.exists():
             return Response([])
@@ -146,20 +222,20 @@ class MonthlyTrendView(APIView):
 
         data = []
         for row in months:
-            inc = float(row['income'] or 0)
-            exp = float(abs(row['expenses'] or 0))
+            credits = row['income'] or Decimal("0.00")
+            expenses = abs(row['expenses'] or Decimal("0.00"))
             data.append({
                 'month': row['month'].strftime('%b %Y'),
-                'income': round(inc, 2),
-                'expenses': round(exp, 2),
-                'net': round(inc - exp, 2),
+                'income': float(_round_decimal(credits, CENT)),
+                'expenses': float(_round_decimal(expenses, CENT)),
+                'net': float(_round_decimal(credits - expenses, CENT)),
             })
 
         return Response(data)
 
 
 class MonthlyComparisonView(APIView):
-    permission_classes = [IsAuthenticated, HasActiveProSubscription]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
         today = timezone.localdate()
@@ -174,9 +250,9 @@ class MonthlyComparisonView(APIView):
         )
 
         def summarize(start, end):
-            period_transactions = Transaction.objects.filter(
-                user=request.user,
-                is_transfer=False,
+            period_transactions = confirmed_non_transfer_transactions(
+                request.user.id,
+            ).filter(
                 date__gte=start,
                 date__lte=end,
             )
@@ -188,10 +264,10 @@ class MonthlyComparisonView(APIView):
                 category_name=F("category__name")
             ).annotate(total=Sum("amount"))
             return (
-                float(abs(totals["expenses"] or 0)),
-                float(totals["income"] or 0),
+                abs(totals["expenses"] or Decimal("0.00")),
+                totals["income"] or Decimal("0.00"),
                 {
-                    row["category_name"] or "Uncategorized": float(abs(row["total"] or 0))
+                    row["category_name"] or "Uncategorized": abs(row["total"] or Decimal("0.00"))
                     for row in categories
                 },
             )
@@ -200,18 +276,27 @@ class MonthlyComparisonView(APIView):
         previous_expenses, previous_income, previous_categories = summarize(previous_month, previous_end)
 
         def change(current, previous):
+            amount = _round_decimal(current - previous, CENT)
             return {
-                "amount": round(current - previous, 2),
-                "percent": round((current - previous) / previous * 100, 1) if previous else None,
+                "amount": float(amount),
+                "percent": (
+                    float(_round_decimal(amount / previous * Decimal("100"), TENTH))
+                    if previous
+                    else None
+                ),
             }
 
         category_names = set(current_categories) | set(previous_categories)
         category_comparison = [
             {
                 "category": name,
-                "current": round(current_categories.get(name, 0), 2),
-                "previous": round(previous_categories.get(name, 0), 2),
-                "change": round(current_categories.get(name, 0) - previous_categories.get(name, 0), 2),
+                "current": float(_round_decimal(current_categories.get(name, Decimal("0.00")), CENT)),
+                "previous": float(_round_decimal(previous_categories.get(name, Decimal("0.00")), CENT)),
+                "change": float(_round_decimal(
+                    current_categories.get(name, Decimal("0.00"))
+                    - previous_categories.get(name, Decimal("0.00")),
+                    CENT,
+                )),
             }
             for name in category_names
         ]
@@ -221,13 +306,13 @@ class MonthlyComparisonView(APIView):
             "current_period": {"start": current_start.isoformat(), "end": today.isoformat()},
             "previous_period": {"start": previous_month.isoformat(), "end": previous_end.isoformat()},
             "expenses": {
-                "current": round(current_expenses, 2),
-                "previous": round(previous_expenses, 2),
+                "current": float(_round_decimal(current_expenses, CENT)),
+                "previous": float(_round_decimal(previous_expenses, CENT)),
                 "change": change(current_expenses, previous_expenses),
             },
             "income": {
-                "current": round(current_income, 2),
-                "previous": round(previous_income, 2),
+                "current": float(_round_decimal(current_income, CENT)),
+                "previous": float(_round_decimal(previous_income, CENT)),
                 "change": change(current_income, previous_income),
             },
             "categories": category_comparison[:5],

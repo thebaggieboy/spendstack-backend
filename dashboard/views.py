@@ -1,77 +1,80 @@
+from decimal import Decimal
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from django.db import models
-from django.db.models import Sum, Count, F, Min
-from django.db.models.functions import TruncDate
-from datetime import timedelta
-from django.utils import timezone
-from transactions.models import Transaction, Category
+from django.db.models import Count, F, Q, Sum
+from transactions.models import Transaction
+
+
+def confirmed_non_transfer_transactions(user_id):
+    return Transaction.objects.filter(
+        user_id=user_id,
+        is_transfer=False,
+        is_pending=False,
+    )
+
 
 class DashboardOverviewView(APIView):
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
-        user_id = request.user.id
+        txs = confirmed_non_transfer_transactions(request.user.id)
+        totals = txs.aggregate(
+            credits=Sum("amount", filter=Q(amount__gt=0)),
+            debits=Sum("amount", filter=Q(amount__lt=0)),
+        )
+        credits = totals["credits"] or Decimal("0.00")
+        debits = totals["debits"] or Decimal("0.00")
+        net_cash_flow = credits + debits
+        savings_rate = Decimal("0")
+        if credits > 0:
+            savings_rate = net_cash_flow / credits * Decimal("100")
 
-        txs = Transaction.objects.filter(user_id=user_id, is_transfer=False)
-
-        income = txs.filter(amount__gt=0).aggregate(total=Sum('amount'))['total'] or 0
-        expenses = txs.filter(amount__lt=0).aggregate(total=Sum('amount'))['total'] or 0
-
-        # In a real app we'd track total balance properly over time
-        total_balance = float(income) + float(expenses)
-
-        savings_rate = 0
-        if income > 0:
-            savings_rate = ((income + expenses) / income) * 100
-
-        # Most money spent in a day
-        expenses_qs = txs.filter(amount__lt=0)
-        daily_expenses = {}
-        for tx in expenses_qs:
-            day_str = tx.date.strftime('%b %d, %Y')
-            if day_str not in daily_expenses:
-                daily_expenses[day_str] = 0.0
-            daily_expenses[day_str] += float(abs(tx.amount))
-            
-        highest_daily_spend = 0
+        largest_spend_day = (
+            txs.filter(amount__lt=0)
+            .values("date")
+            .annotate(total=Sum("amount"))
+            .order_by("total", "date")
+            .first()
+        )
+        highest_daily_spend = Decimal("0.00")
         highest_daily_spend_date = None
-        if daily_expenses:
-            worst_day = max(daily_expenses.items(), key=lambda x: x[1])
-            highest_daily_spend_date = worst_day[0]
-            highest_daily_spend = worst_day[1]
+        if largest_spend_day:
+            highest_daily_spend = abs(largest_spend_day["total"])
+            highest_daily_spend_date = largest_spend_day["date"].strftime("%b %d, %Y")
 
-        # Who you've sent the most money to
-        top_merchants = txs.filter(amount__lt=0).values('merchant_name').annotate(total=Sum('amount')).order_by('total')
+        top_payee_row = (
+            txs.filter(amount__lt=0)
+            .values("merchant_name")
+            .annotate(total=Sum("amount"))
+            .order_by("total", "merchant_name")
+            .first()
+        )
         top_payee = None
-        top_payee_amount = 0
-        if top_merchants.exists():
-            worst_merchant = top_merchants.first()
-            top_payee = worst_merchant['merchant_name'] or "Unknown"
-            top_payee_amount = float(abs(worst_merchant['total']))
+        top_payee_amount = Decimal("0.00")
+        if top_payee_row:
+            top_payee = top_payee_row["merchant_name"] or "Unknown"
+            top_payee_amount = abs(top_payee_row["total"])
 
         return Response({
-            "total_balance": total_balance,
-            "income_all_time": float(income),
-            "expenses_all_time": float(abs(expenses)),
+            "net_cash_flow": float(net_cash_flow),
+            "credits_all_time": float(credits),
+            "expenses_all_time": float(abs(debits)),
             "savings_rate": float(savings_rate),
-            "highest_daily_spend": highest_daily_spend,
+            "highest_daily_spend": float(highest_daily_spend),
             "highest_daily_spend_date": highest_daily_spend_date,
             "top_payee": top_payee,
-            "top_payee_amount": top_payee_amount
+            "top_payee_amount": float(top_payee_amount),
         })
+
 
 class CategoryBreakdownView(APIView):
     permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        user_id = request.user.id
 
-        breakdown = Transaction.objects.filter(
-            user_id=user_id, 
+    def get(self, request):
+        breakdown = confirmed_non_transfer_transactions(request.user.id).filter(
             amount__lt=0,
-            is_transfer=False,
         ).values(
             name=F('category__name'),
             color=F('category__color')
@@ -92,46 +95,40 @@ class CategoryBreakdownView(APIView):
 
 class CashFlowView(APIView):
     permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        user_id = request.user.id
 
-        transactions = Transaction.objects.filter(
-            user_id=user_id,
-            is_transfer=False,
-        ).order_by('date')
-        
+    def get(self, request):
+        transactions = confirmed_non_transfer_transactions(request.user.id).order_by("date")
         daily_stats = {}
-        for tx in transactions:
-            day_str = tx.date.strftime('%b %d')
-            if day_str not in daily_stats:
-                daily_stats[day_str] = {"income": 0.0, "expenses": 0.0}
-                
+        for tx in transactions.only("date", "amount").iterator():
+            date_key = tx.date.isoformat()
+            if date_key not in daily_stats:
+                daily_stats[date_key] = {
+                    "income": Decimal("0.00"),
+                    "expenses": Decimal("0.00"),
+                }
+
             if tx.amount > 0:
-                daily_stats[day_str]["income"] += float(tx.amount)
+                daily_stats[date_key]["income"] += tx.amount
             else:
-                daily_stats[day_str]["expenses"] += float(abs(tx.amount))
+                daily_stats[date_key]["expenses"] += abs(tx.amount)
 
         data = []
-        for day, stats in daily_stats.items():
+        for day, stats in sorted(daily_stats.items()):
             data.append({
                 "date": day,
-                "income": stats["income"],
-                "expenses": stats["expenses"]
+                "income": float(stats["income"]),
+                "expenses": float(stats["expenses"]),
             })
 
         return Response(data)
 
+
 class TopMerchantsView(APIView):
     permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        user_id = request.user.id
 
-        merchants = Transaction.objects.filter(
-            user_id=user_id,
+    def get(self, request):
+        merchants = confirmed_non_transfer_transactions(request.user.id).filter(
             amount__lt=0,
-            is_transfer=False,
         ).values(
             'merchant_name', 
             cat_name=F('category__name')

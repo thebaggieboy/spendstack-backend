@@ -1,5 +1,5 @@
 import uuid
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
 from django.utils import timezone
@@ -56,6 +56,72 @@ def credit_verified_funding(reference, verified_data):
         wallet_transaction.metadata = {
             "channel": verified_data.get("channel"),
             "gateway_response": verified_data.get("gateway_response"),
+        }
+        wallet_transaction.save(
+            update_fields=[
+                "balance_before",
+                "balance_after",
+                "status",
+                "completed_at",
+                "metadata",
+            ]
+        )
+        return True
+
+
+def credit_bachs_funding(reference, event_data):
+    with transaction.atomic():
+        wallet_transaction = (
+            WalletTransaction.objects.select_for_update()
+            .select_related("user")
+            .filter(reference=reference, type=WalletTransaction.DEPOSIT)
+            .first()
+        )
+        if not wallet_transaction:
+            return False
+        metadata = wallet_transaction.metadata or {}
+        if metadata.get("payment_provider") != "bachs":
+            return False
+        if wallet_transaction.status == WalletTransaction.COMPLETED:
+            return True
+
+        try:
+            amount = Decimal(str(event_data.get("amount", "")))
+        except (InvalidOperation, TypeError, ValueError):
+            amount = None
+        if (
+            amount is None
+            or not amount.is_finite()
+            or event_data.get("status") != "SUCCEEDED"
+            or event_data.get("currency") != "NGN"
+            or event_data.get("reference") != reference
+            or amount != wallet_transaction.amount
+        ):
+            wallet_transaction.status = WalletTransaction.FAILED
+            wallet_transaction.metadata = {
+                **metadata,
+                "verification": "amount_currency_or_reference_mismatch",
+            }
+            wallet_transaction.save(update_fields=["status", "metadata"])
+            return False
+
+        wallet, _ = Wallet.objects.get_or_create(user=wallet_transaction.user)
+        wallet = Wallet.objects.select_for_update().get(pk=wallet.pk)
+        balance_before = wallet.available_balance
+        wallet.available_balance += wallet_transaction.amount
+        wallet.save(update_fields=["available_balance", "updated_at"])
+
+        wallet_transaction.balance_before = balance_before
+        wallet_transaction.balance_after = wallet.available_balance
+        wallet_transaction.status = WalletTransaction.COMPLETED
+        wallet_transaction.completed_at = timezone.now()
+        wallet_transaction.metadata = {
+            **metadata,
+            "verification": "signed_bachs_collection_succeeded",
+            "settlement_amount": event_data.get("settlement_amount"),
+            "settlement_currency": event_data.get("settlement_currency"),
+            "processing_fee": event_data.get("processing_fee"),
+            "processing_fee_currency": event_data.get("processing_fee_currency"),
         }
         wallet_transaction.save(
             update_fields=[

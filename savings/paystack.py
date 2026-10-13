@@ -10,8 +10,13 @@ class PaystackError(Exception):
     pass
 
 
+def paystack_secret_key():
+    secret_key = os.environ.get("PAYSTACK_SECRET_KEY", "").strip()
+    return secret_key or os.environ.get("NEXT_PAYSTACK_SECRET_KEY", "").strip()
+
+
 def paystack_request(method, path, *, params=None, payload=None):
-    secret_key = os.environ.get("PAYSTACK_SECRET_KEY")
+    secret_key = paystack_secret_key()
     if not secret_key:
         raise PaystackError("Paystack is not configured on the server.")
 
@@ -35,6 +40,8 @@ def paystack_request(method, path, *, params=None, payload=None):
     except ValueError as exc:
         raise PaystackError("Paystack returned an invalid response.") from exc
 
+    if not isinstance(result, dict):
+        raise PaystackError("Paystack returned an invalid response.")
     if not response.ok or not result.get("status"):
         message = result.get("message")
         if response.status_code in (401, 403):
@@ -42,4 +49,7 @@ def paystack_request(method, path, *, params=None, payload=None):
         if response.status_code >= 500:
             raise PaystackError("Paystack is temporarily unavailable.")
         raise PaystackError(message if isinstance(message, str) else "Paystack could not process the request.")
-    return result.get("data", {})
+    data = result.get("data")
+    if not isinstance(data, (dict, list)):
+        raise PaystackError("Paystack returned an incomplete response.")
+    return data

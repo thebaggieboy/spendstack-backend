@@ -16,7 +16,7 @@ The analytics dashboard is at `/admin/analytics` and is available only to authen
 
 ## Spending tools
 
-Statement imports apply each user's active transaction rules to the parsed description and merchant. Rules can rename merchants, assign a category, and explicitly mark or exempt a matching transaction as a transfer. Description detection recognizes common transfer narration (including NIP/TRF formats); transfer transactions remain visible in history but are excluded from income, expense, cash-flow, insights, and spending-alert totals. Existing transactions are backfilled during migration `transactions.0004`.
+Statement imports apply each user's active transaction rules to the parsed description and merchant. Rules can rename merchants, assign a category, and explicitly mark or exempt a matching transaction as a transfer. Description detection recognizes common transfer narration (including NIP/TRF formats); transfer transactions remain visible in history but are excluded from income, expense, cash-flow, spending-insight totals, and spending-alert totals. A separate insight reports the most frequent named outgoing transfer recipient. Existing transactions are backfilled during migration `transactions.0004`.
 
 Authenticated endpoints:
 
@@ -24,6 +24,7 @@ Authenticated endpoints:
 | --- | --- | --- |
 | `POST` | `/api/dashboard/chat/` | Ask questions about all of the signed-in user's transactions or one owned statement; returns a Gemini-generated answer |
 | `GET` | `/api/dashboard/monthly-comparison/` | Compare current month-to-date income/spending with the same calendar days of the previous month, including category changes; transfers excluded |
+| `GET` | `/api/dashboard/insights/?period=all|month|90days|year` | Read financial insights for the selected period, including category share and the most frequent outgoing transfer recipient |
 | `GET` | `/api/dashboard/recurring-bills/` | Detect weekly, biweekly, or monthly repeat outflows from at least three similar transactions |
 | `GET, POST` | `/api/transactions/alerts/` | List current weekly/monthly spending thresholds or create an alert |
 | `PATCH, DELETE` | `/api/transactions/alerts/{id}/` | Change or remove one of the signed-in user's alerts |
@@ -39,6 +40,7 @@ Statement uploads support a review-before-import flow:
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/analysis/preview/` | Parse and categorize CSV, Excel (`.xlsx`/`.xls`), or PDF files (maximum 10 MB), apply the user's rules, and return a temporary transaction preview plus skipped-row warnings |
+| `GET` | `/api/analysis/statements/` | List uploaded statements with the first and last transaction dates |
 | `POST` | `/api/analysis/preview/{id}/confirm/` | Import the preview after user confirmation; previews expire after one hour |
 | `DELETE` | `/api/analysis/preview/{id}/` | Discard a preview |
 | `POST` | `/api/analysis/upload/` | Legacy direct-import endpoint; exact duplicate files are rejected |
@@ -47,9 +49,19 @@ Imported statement files are fingerprinted with SHA-256 per user, so uploading t
 
 Statement import is local and deterministic: CSV and Excel headers are discovered within the first 30 rows, Excel transaction tables are read from all worksheets, amounts are parsed as decimals (including common currency labels and dash placeholders in debit/credit columns), and searchable PDF tables/text are parsed on the backend. PDFium is used as a local text-extraction fallback when the primary PDF reader cannot open a recoverable PDF structure. Descriptions and explicit debit/credit fields drive merchant cleanup and category assignment; user-defined rules are applied afterward. CSV/Excel source rows and sheet names are retained for diagnostics. Rows with missing/invalid fields, ambiguous unsigned amounts, or precision/range that cannot be stored exactly are reported; any such warning blocks import, avoiding silent partial imports. Full transaction descriptions are stored without the previous 500-character truncation. These are deterministic heuristics, not bank-certified OCR or category models: ambiguous layouts must be reviewed or exported to a structured CSV/Excel format. Scanned PDFs without selectable text and structurally unreadable PDFs are rejected with an actionable error rather than sent to an AI service. Statement uploads do not call Gemini or require a Gemini API key; Gemini is used for questions in the authenticated statement-chat endpoint.
 
+Statement preview/import also extracts explicitly labelled opening/closing balances and total credits/debits from CSV, Excel, and searchable PDF text. These values are retained with the statement and compared on its detail page against posted transaction rows. Bank reconciliation totals include posted transfers and exclude pending transactions; spending categories and highest daily spend exclude transfers. Transaction rows remain authoritative: a mismatch is shown for review and does not replace row-derived figures. Missing or conflicting printed summary values are reported as unavailable or needing review rather than inferred.
+
 ## Wallet, money locks, and scheduled payouts
 
-Set `PAYSTACK_SECRET_KEY` in the backend environment. The value must be a server-side Paystack secret key and must never be exposed to the frontend. Set `SPENDSTACK_FRONTEND_URL` to the deployed frontend origin so Paystack can return users to the wallet page. Apply migrations with `python manage.py migrate`.
+Set `NEXT_PAYSTACK_SECRET_KEY` or `PAYSTACK_SECRET_KEY` in the backend environment. The backend accepts the existing `NEXT_PAYSTACK_SECRET_KEY` name and prefers `PAYSTACK_SECRET_KEY` when both are set. Either value must be a server-side Paystack secret key and must never be exposed to the frontend. Use Paystack test credentials for checkout integration tests; test credentials cannot send real funds, and transfers may require Paystack to enable the feature on the account. Set `SPENDSTACK_FRONTEND_URL` to the deployed frontend origin so payment providers can return users to the wallet page; it defaults to `https://spendstack.vercel.app`. For a local mobile-device test, set this to the frontend's LAN URL. Apply migrations with `python manage.py migrate`.
+
+### Bachs wallet checkout
+
+To enable Bachs alongside Paystack, configure `BACHS_API_KEY` and `BACHS_WEBHOOK_SECRET` on the backend only. Use a `sk_sandbox_...` key during integration testing; the API host is selected from the key prefix. Live collections require a `sk_live_...` key and an approved Bachs account. Give the key the `payments:write` scope.
+
+Register `https://<backend-host>/api/savings/webhooks/bachs/` in the Bachs developer portal and subscribe it to `collection.succeeded`. Store that endpoint's signing secret as `BACHS_WEBHOOK_SECRET`. The webhook must be publicly reachable over HTTPS in production. Wallet balances are credited only after a valid, recent signed event matches the checkout reference, exact NGN amount and currency. The browser redirect never confirms or credits a Bachs payment.
+
+For local testing from a phone, start Django listening on the network interface (for example, `python manage.py runserver 0.0.0.0:8000`) and allow that port through the development machine's firewall. The frontend rewrites a localhost API host to the host used to open the frontend, but the backend must still be reachable on the same network. Configure the Paystack dashboard webhook URL to the public backend URL; a local/LAN URL cannot receive Paystack webhooks.
 
 Authenticated endpoints:
 
@@ -59,7 +71,7 @@ Authenticated endpoints:
 | `POST` | `/api/savings/fund/initialize/` | Initialize a Paystack Checkout top-up |
 | `GET` | `/api/savings/fund/verify/?reference=...` | Verify a checkout payment and credit it once |
 | `GET, POST` | `/api/savings/locks/` | List locks or reserve available wallet funds until maturity |
-| `GET` | `/api/savings/bank-directory/` | List banks supported by Paystack |
+| `GET` | `/api/savings/bank-directory/` | List Nigerian banks supported by Paystack, including all pages of results |
 | `GET, POST` | `/api/savings/bank-accounts/` | List the user's verified recipients or verify/register one |
 | `GET, POST` | `/api/savings/budgets/` | List or create a spending budget |
 | `DELETE` | `/api/savings/budgets/{id}/` | Delete one of the signed-in user's budgets |

@@ -17,6 +17,146 @@ _AMOUNT_HEADERS = ("amount", "transaction amount", "value")
 _DEBIT_HEADERS = ("debit", "withdrawal", "withdrawn", "money out", "outflow", "paid out", "dr")
 _CREDIT_HEADERS = ("credit", "deposit", "lodgement", "money in", "inflow", "paid in", "cr")
 _DIRECTION_HEADERS = ("dr/cr", "debit/credit", "type", "direction")
+_STATEMENT_SUMMARY_LABELS = {
+    "opening_balance": re.compile(
+        r"^\s*(?:opening balance|balance b\s*/\s*f|balance brought forward|brought forward balance)\b",
+        re.I,
+    ),
+    "closing_balance": re.compile(
+        r"^\s*(?:closing balance|balance c\s*/\s*f|balance carried forward|carried forward balance)\b",
+        re.I,
+    ),
+    "total_credits": re.compile(
+        r"^\s*(?:total credits?|total deposits?|total lodgements?|total amount credited|total inflow)\b",
+        re.I,
+    ),
+    "total_debits": re.compile(
+        r"^\s*(?:total debits?|total withdrawals?|total amount debited|total outflow)\b",
+        re.I,
+    ),
+}
+_SUMMARY_AMOUNT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:[₦$£€]\s*)?\(?-?\d[\d,]*(?:\.\d+)?\)?"
+    r"(?:\s*(?:DR|CR|DEBIT|CREDIT))?(?![A-Za-z0-9])",
+    re.I,
+)
+
+
+def _summary_label(text):
+    for field, pattern in _STATEMENT_SUMMARY_LABELS.items():
+        match = pattern.match(str(text or ""))
+        if match:
+            return field, match.end()
+    return None, None
+
+
+def _summary_amount(value):
+    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        try:
+            return _parse_amount(value)
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = _SUMMARY_AMOUNT_PATTERN.fullmatch(text)
+    if not match:
+        return None
+    try:
+        return _parse_amount(text)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _collect_summary_values(rows):
+    found = {field: set() for field in _STATEMENT_SUMMARY_LABELS}
+    for row in rows:
+        cells = [str(value).strip() for value in row]
+        labels = [
+            (index, *_summary_label(value))
+            for index, value in enumerate(cells)
+        ]
+        for index, field, label_end in labels:
+            if not field:
+                continue
+            amount = None
+            remainder = cells[index][label_end:]
+            matches = list(_SUMMARY_AMOUNT_PATTERN.finditer(remainder))
+            if matches:
+                amount = _summary_amount(matches[-1].group(0))
+            if amount is None:
+                neighboring = sorted(
+                    (
+                        (abs(other_index - index), other_index, _summary_amount(value))
+                        for other_index, value in enumerate(cells)
+                        if other_index != index
+                    ),
+                    key=lambda item: (item[0], item[1]),
+                )
+                amount = next(
+                    (candidate for _, _, candidate in neighboring if candidate is not None),
+                    None,
+                )
+            if amount is not None:
+                if field in ("total_credits", "total_debits"):
+                    amount = abs(amount)
+                found[field].add(str(amount.quantize(Decimal("0.01"))))
+    return found
+
+
+def extract_statement_summary(file_content, filename):
+    """Extract only explicitly labelled statement totals and balances."""
+    extension = str(filename).rsplit(".", 1)[-1].casefold() if "." in str(filename) else ""
+    if extension == "csv":
+        try:
+            try:
+                decoded = file_content.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                encoding = "utf-16" if file_content.startswith((b"\xff\xfe", b"\xfe\xff")) else "cp1252"
+                decoded = file_content.decode(encoding)
+        except UnicodeDecodeError as exc:
+            raise ValueError("Could not decode the statement while checking its balance summary.") from exc
+        rows = list(csv.reader(io.StringIO(decoded), delimiter=_detect_delimiter(decoded[:8192])))
+        values = _collect_summary_values(rows)
+    elif extension in ("xlsx", "xls"):
+        try:
+            workbook = pd.read_excel(
+                io.BytesIO(file_content),
+                sheet_name=None,
+                header=None,
+                dtype=object,
+                keep_default_na=False,
+            )
+        except Exception as exc:
+            raise ValueError(f"Could not inspect the statement balance summary: {exc}") from exc
+        collected = {field: set() for field in _STATEMENT_SUMMARY_LABELS}
+        for frame in workbook.values():
+            sheet_values = _collect_summary_values(frame.itertuples(index=False, name=None))
+            for field, candidates in sheet_values.items():
+                collected[field].update(candidates)
+        values = collected
+    elif extension == "pdf":
+        try:
+            with pdfplumber.open(io.BytesIO(file_content)) as pdf:
+                pages = [(page_number, page.extract_text() or "") for page_number, page in enumerate(pdf.pages, start=1)]
+        except Exception:
+            pages = _extract_pdfium_text(file_content)
+        values = _collect_summary_values(
+            line.split("|") for _, text in pages for line in text.splitlines()
+        )
+    else:
+        return {}
+
+    summary = {}
+    ambiguous_fields = []
+    for field, candidates in values.items():
+        if len(candidates) == 1:
+            summary[field] = next(iter(candidates))
+        elif len(candidates) > 1:
+            ambiguous_fields.append(field)
+    if ambiguous_fields:
+        summary["ambiguous_fields"] = sorted(ambiguous_fields)
+    return summary
 
 
 def parse_csv_statement(file_content):
@@ -226,6 +366,8 @@ def _parse_tabular_statement(frame, source_sheet=None, allow_no_header=False, so
             continue
         values = [value for value in row.tolist() if not _is_blank(value)]
         if not values:
+            continue
+        if any(_summary_label(value)[0] for value in values):
             continue
 
         date_value = row[date_col]
@@ -521,9 +663,11 @@ def parse_pdf_statement_detailed(file_obj):
                         warning.replace("Row ", f"PDF page {page_number}, row ", 1)
                         for warning in warnings
                     )
-                extracted = page.extract_text()
-                if extracted:
-                    extracted_pages.append((page_number, extracted))
+            if not table_transactions:
+                for page_number, page in enumerate(pdf.pages, start=1):
+                    extracted = page.extract_text()
+                    if extracted:
+                        extracted_pages.append((page_number, extracted))
     except Exception:
         extracted_pages = _extract_pdfium_text(file_bytes)
         used_pdfium_fallback = True

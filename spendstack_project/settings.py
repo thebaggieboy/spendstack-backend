@@ -188,5 +188,5 @@ SIMPLE_JWT = {
 
 SPENDSTACK_FRONTEND_URL = os.environ.get(
     "SPENDSTACK_FRONTEND_URL",
-    "http://localhost:3000",
+    "https://spendstack.vercel.app",
 ).rstrip("/")

@@ -1,7 +1,7 @@
 import hashlib
 import os
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import timedelta
-from decimal import Decimal, InvalidOperation
 
 from django.db import IntegrityError, transaction
 from django.utils import timezone
@@ -14,6 +14,7 @@ from .utils.parser import (
     parse_csv_statement_detailed,
     parse_excel_statement_detailed,
     parse_pdf_statement_detailed,
+    extract_statement_summary,
 )
 from .utils.categorizer import categorize_transactions
 from transactions.models import Transaction, Account, Category
@@ -94,17 +95,19 @@ def _parse_statement_file(file_obj, content):
     return categorized_data, warnings
 
 
-def _create_statement(user, filename, file_sha256, categorized_data):
+def _create_statement(user, filename, file_sha256, categorized_data, summary_data=None):
     account, _ = Account.objects.get_or_create(name="Default Checking", user=user)
     statement = Statement.objects.create(
         user=user,
         filename=filename,
         file_sha256=file_sha256,
+        summary_data=summary_data or {},
     )
     rules = list(
         TransactionRule.objects.filter(user=user, is_active=True).order_by("-priority", "id")
     )
-    created_transactions = []
+    transaction_rows = []
+    category_names = set()
     for tx in categorized_data:
         base_merchant = tx.get("original_merchant_name", tx.get("merchant_name", "Unknown"))
         base_category = tx.get("original_category_name", tx.get("category_name", "Other"))
@@ -114,25 +117,132 @@ def _create_statement(user, filename, file_sha256, categorized_data):
             base_category,
             rules,
         )
-        cat, _ = Category.objects.get_or_create(
-            name=cat_name,
-            defaults={"color": "#9ca3af", "is_system": cat_name == "Transfers"},
+        category_names.add(cat_name)
+        transaction_rows.append(
+            {
+                "date": tx["date"],
+                "amount": tx["amount"],
+                "merchant_name": merchant_name,
+                "original_merchant_name": base_merchant,
+                "original_category_name": base_category,
+                "raw_description": tx["raw_description"],
+                "category_name": cat_name,
+                "is_transfer": is_transfer,
+            }
         )
-        obj = Transaction.objects.create(
+
+    existing_categories = {
+        category.name: category
+        for category in Category.objects.filter(name__in=category_names)
+    }
+    missing_categories = category_names - existing_categories.keys()
+    if missing_categories:
+        Category.objects.bulk_create(
+            [
+                Category(
+                    name=name,
+                    color="#9ca3af",
+                    is_system=name == "Transfers",
+                )
+                for name in missing_categories
+            ],
+            ignore_conflicts=True,
+        )
+        existing_categories.update(
+            {
+                category.name: category
+                for category in Category.objects.filter(name__in=missing_categories)
+            }
+        )
+
+    transactions = [
+        Transaction(
             user=user,
             account=account,
             statement=statement,
-            date=tx["date"],
-            amount=tx["amount"],
-            merchant_name=merchant_name,
-            original_merchant_name=base_merchant,
-            original_category_name=base_category,
-            raw_description=tx["raw_description"],
-            category=cat,
-            is_transfer=is_transfer,
+            date=row["date"],
+            amount=row["amount"],
+            merchant_name=row["merchant_name"],
+            original_merchant_name=row["original_merchant_name"],
+            original_category_name=row["original_category_name"],
+            raw_description=row["raw_description"],
+            category=existing_categories[row["category_name"]],
+            is_transfer=row["is_transfer"],
         )
-        created_transactions.append(obj.id)
+        for row in transaction_rows
+    ]
+    created_transactions = Transaction.objects.bulk_create(transactions, batch_size=500)
     return statement, created_transactions
+
+
+def _statement_reconciliation(summary_data, credits, debits):
+    summary_data = summary_data if isinstance(summary_data, dict) else {}
+    ambiguous_fields = set(summary_data.get("ambiguous_fields", []))
+    row_net = credits + debits
+    checks = {}
+    mismatch = False
+    for field, row_value in (("total_credits", credits), ("total_debits", abs(debits))):
+        reported = summary_data.get(field)
+        if field in ambiguous_fields:
+            checks[field] = {"status": "review", "reported": None, "from_transactions": float(row_value)}
+        elif reported is None:
+            checks[field] = {"status": "unavailable", "reported": None, "from_transactions": float(row_value)}
+        else:
+            reported_value = Decimal(str(reported))
+            difference = (row_value - reported_value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            matches = difference == 0
+            mismatch = mismatch or not matches
+            checks[field] = {
+                "status": "match" if matches else "mismatch",
+                "reported": float(reported_value),
+                "from_transactions": float(row_value),
+                "difference": float(difference),
+            }
+
+    opening = summary_data.get("opening_balance")
+    closing = summary_data.get("closing_balance")
+    balance_check = {"status": "unavailable", "opening_balance": None, "closing_balance": None}
+    if "opening_balance" in ambiguous_fields or "closing_balance" in ambiguous_fields:
+        balance_check["status"] = "review"
+    elif opening is not None and closing is not None:
+        opening_value = Decimal(str(opening))
+        closing_value = Decimal(str(closing))
+        movement = (closing_value - opening_value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        difference = (row_net - movement).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        matches = difference == 0
+        mismatch = mismatch or not matches
+        balance_check = {
+            "status": "match" if matches else "mismatch",
+            "opening_balance": float(opening_value),
+            "closing_balance": float(closing_value),
+            "reported_movement": float(movement),
+            "transaction_net": float(row_net),
+            "difference": float(difference),
+        }
+    elif opening is not None or closing is not None:
+        balance_check.update({
+            "opening_balance": float(Decimal(str(opening))) if opening is not None else None,
+            "closing_balance": float(Decimal(str(closing))) if closing is not None else None,
+        })
+
+    if mismatch:
+        overall = "mismatch"
+    elif "review" in [check["status"] for check in checks.values()] or balance_check["status"] == "review":
+        overall = "review"
+    elif any(check["status"] == "match" for check in checks.values()) or balance_check["status"] == "match":
+        overall = "matched"
+    else:
+        overall = "unavailable"
+    return {
+        "status": overall,
+        "statement_summary": {
+            field: summary_data.get(field)
+            for field in ("opening_balance", "closing_balance", "total_credits", "total_debits")
+        },
+        "ambiguous_fields": sorted(ambiguous_fields),
+        "checks": checks,
+        "balance_movement": balance_check,
+    }
 
 
 def _apply_user_rules(user, categorized_data):
@@ -184,6 +294,7 @@ class StatementPreviewView(APIView):
 
         try:
             categorized_data, warnings = _parse_statement_file(file_obj, content)
+            summary_data = extract_statement_summary(content, file_obj.name)
             categorized_data = _apply_user_rules(request.user, categorized_data)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -201,6 +312,7 @@ class StatementPreviewView(APIView):
             filename=os.path.basename(file_obj.name)[:255],
             file_sha256=file_sha256,
             transactions=categorized_data,
+            summary_data=summary_data,
             warnings=warnings,
             expires_at=timezone.now() + timedelta(hours=1),
         )
@@ -208,6 +320,7 @@ class StatementPreviewView(APIView):
             {
                 "preview_id": preview.id,
                 "filename": preview.filename,
+                "statement_summary": preview.summary_data,
                 "transactions": [
                     {
                         "index": index,
@@ -261,6 +374,7 @@ class StatementPreviewConfirmView(APIView):
                     preview.filename,
                     preview.file_sha256,
                     preview.transactions,
+                    preview.summary_data,
                 )
                 preview.delete()
         except IntegrityError:
@@ -307,6 +421,7 @@ class StatementUploadView(APIView):
 
         try:
             categorized_data, warnings = _parse_statement_file(file_obj, content)
+            summary_data = extract_statement_summary(content, file_obj.name)
             if warnings:
                 return Response(
                     {
@@ -324,6 +439,7 @@ class StatementUploadView(APIView):
                     os.path.basename(file_obj.name)[:255],
                     file_sha256,
                     categorized_data,
+                    summary_data,
                 )
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -350,15 +466,26 @@ class StatementListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        statements = Statement.objects.filter(user=request.user).order_by('-upload_date')
+        from django.db.models import Count, Max, Min
+
+        statements = (
+            Statement.objects.filter(user=request.user)
+            .annotate(
+                transaction_count=Count("transactions"),
+                period_start=Min("transactions__date"),
+                period_end=Max("transactions__date"),
+            )
+            .order_by("-upload_date")
+        )
         data = []
         for stmt in statements:
-            tx_count = stmt.transactions.count()
             data.append({
                 "id": stmt.id,
                 "filename": stmt.filename,
                 "upload_date": stmt.upload_date.strftime('%b %d, %Y'),
-                "transaction_count": tx_count
+                "transaction_count": stmt.transaction_count,
+                "period_start": stmt.period_start.isoformat() if stmt.period_start else None,
+                "period_end": stmt.period_end.isoformat() if stmt.period_end else None,
             })
             
         return Response(data)
@@ -374,27 +501,41 @@ class StatementDetailView(APIView):
         stmt = get_object_or_404(Statement, pk=pk, user=request.user)
         transactions = stmt.transactions.select_related('category').order_by('date', 'id')
 
-        # Aggregate stats
-        financial_transactions = transactions.filter(is_transfer=False)
-        income = financial_transactions.filter(amount__gt=0).aggregate(total=Sum('amount'))['total'] or 0
-        expenses = financial_transactions.filter(amount__lt=0).aggregate(total=Sum('amount'))['total'] or 0
-        merchant_count = financial_transactions.values('merchant_name').distinct().count()
+        # Bank-statement totals include posted transfers; category spending does not.
+        posted_transactions = transactions.filter(is_pending=False)
+        financial_transactions = posted_transactions.filter(is_transfer=False)
+        credits = posted_transactions.filter(amount__gt=0).aggregate(total=Sum('amount'))['total'] or Decimal("0.00")
+        expenses = posted_transactions.filter(amount__lt=0).aggregate(total=Sum('amount'))['total'] or Decimal("0.00")
+        highest_spend = (
+            financial_transactions.filter(amount__lt=0)
+            .values("date")
+            .annotate(total=Sum("amount"))
+            .order_by("total", "date")
+            .first()
+        )
+        merchant_count = (
+            financial_transactions.exclude(merchant_name="")
+            .values('merchant_name')
+            .distinct()
+            .count()
+        )
 
-        # Build running balance timeline
+        # This is a cumulative flow from zero, not an account balance.
         tx_list = []
-        running_balance = 0.0
+        cumulative_flow = Decimal("0.00")
         for tx in transactions:
-            running_balance += float(tx.amount)
+            if not tx.is_pending:
+                cumulative_flow += tx.amount
             tx_list.append({
                 "id": tx.id,
                 "date": tx.date.strftime('%Y-%m-%d'),
-                "date_display": tx.date.strftime('%b %d'),
+                "date_display": tx.date.strftime('%b %d, %Y'),
                 "raw_description": tx.raw_description,
                 "merchant_name": tx.merchant_name or tx.raw_description[:40],
                 "amount": float(tx.amount),
                 "category": tx.category.name if tx.category else "Uncategorized",
                 "category_color": tx.category.color if tx.category else "#9ca3af",
-                "running_balance": round(running_balance, 2),
+                "cumulative_flow": float(cumulative_flow),
                 "is_transfer": tx.is_transfer,
             })
 
@@ -408,35 +549,50 @@ class StatementDetailView(APIView):
         for c in cat_qs:
             category_data.append({
                 "name": c['name'] or "Uncategorized",
-                "value": round(float(abs(c['total'])), 2),
+                "value": float(abs(c['total']).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
                 "color": c['color'] or "#9ca3af",
             })
 
-        # Daily spending aggregation
-        daily_map: dict = {}
-        for tx in tx_list:
-            if tx['is_transfer']:
-                continue
-            d = tx['date_display']
-            if d not in daily_map:
-                daily_map[d] = {"date": d, "income": 0.0, "expenses": 0.0}
+        daily_map = {}
+        for tx in posted_transactions.values('date', 'amount').iterator():
+            date_key = tx['date'].isoformat()
+            if date_key not in daily_map:
+                daily_map[date_key] = {
+                    "date": tx['date'].strftime('%b %d, %Y'),
+                    "credits": Decimal("0.00"),
+                    "expenses": Decimal("0.00"),
+                }
             if tx['amount'] > 0:
-                daily_map[d]['income'] += tx['amount']
+                daily_map[date_key]['credits'] += tx['amount']
             else:
-                daily_map[d]['expenses'] += abs(tx['amount'])
-        daily_data = list(daily_map.values())
+                daily_map[date_key]['expenses'] += abs(tx['amount'])
+        daily_data = [
+            {
+                "date": values["date"],
+                "credits": float(values["credits"]),
+                "expenses": float(values["expenses"]),
+            }
+            for _, values in sorted(daily_map.items())
+        ]
 
         return Response({
             "id": stmt.id,
             "filename": stmt.filename,
             "upload_date": stmt.upload_date.strftime('%B %d, %Y'),
             "stats": {
-                "total_income": round(float(income), 2),
-                "total_expenses": round(float(abs(expenses)), 2),
-                "net": round(float(income) + float(expenses), 2),
+                "total_credits": float(credits.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+                "total_expenses": float(abs(expenses).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+                "net": float((credits + expenses).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
                 "transaction_count": transactions.count(),
                 "merchant_count": merchant_count,
+                "highest_daily_spend": float(abs(highest_spend["total"]).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if highest_spend else 0.0,
+                "highest_daily_spend_date": highest_spend["date"].isoformat() if highest_spend else None,
             },
+            "statement_reconciliation": _statement_reconciliation(
+                stmt.summary_data,
+                credits,
+                expenses,
+            ),
             "transactions": tx_list,
             "category_breakdown": category_data,
             "daily_data": daily_data,

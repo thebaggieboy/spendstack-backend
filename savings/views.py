@@ -20,10 +20,12 @@ from rest_framework.views import APIView
 
 from transactions.models import Transaction
 from billing.services import BillingError, process_subscription_event
+from .bachs import BachsError, create_checkout_session, verify_webhook_signature
 from .models import BankAccount, Budget, LockPeriod, Schedule, Wallet, WalletTransaction
-from .paystack import PaystackError, paystack_request
+from .paystack import PaystackError, paystack_request, paystack_secret_key
 from .services import (
     credit_verified_funding,
+    credit_bachs_funding,
     finalize_payout_attempt,
     initiate_schedule_payout,
     to_kobo,
@@ -120,9 +122,15 @@ class FundingInitializeView(APIView):
                 {"detail": "Funding must be at least ₦100 and no more than ₦10,000,000 per transaction."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        gateway = request.data.get("gateway", "paystack")
+        if gateway not in ("paystack", "bachs"):
+            return Response(
+                {"detail": "Choose Paystack or Bachs as the payment gateway."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         _wallet_for(request.user)
         reference = f"SS-FUND-{uuid.uuid4().hex}"
-        WalletTransaction.objects.create(
+        wallet_transaction = WalletTransaction.objects.create(
             user=request.user,
             type=WalletTransaction.DEPOSIT,
             amount=amount,
@@ -131,7 +139,53 @@ class FundingInitializeView(APIView):
             status=WalletTransaction.PENDING,
             reference=reference,
             description="Wallet funding",
+            metadata={"payment_provider": gateway} if gateway == "bachs" else None,
         )
+        if gateway == "bachs":
+            success_url = (
+                f"{settings.SPENDSTACK_FRONTEND_URL}/dashboard/lock-money"
+                f"?funding=bachs-return&reference={reference}"
+            )
+            cancel_url = (
+                f"{settings.SPENDSTACK_FRONTEND_URL}/dashboard/lock-money"
+                "?funding=bachs-cancel"
+            )
+            try:
+                checkout = create_checkout_session(
+                    amount=_money(amount),
+                    email=request.user.email,
+                    reference=reference,
+                    success_url=success_url,
+                    cancel_url=cancel_url,
+                    metadata={
+                        "purpose": "spendstack_wallet_funding",
+                        "wallet_transaction_id": str(wallet_transaction.id),
+                    },
+                )
+            except BachsError as exc:
+                if not exc.uncertain:
+                    WalletTransaction.objects.filter(reference=reference).update(status=WalletTransaction.FAILED)
+                logger.warning("Bachs wallet funding initialization failed: %s", exc)
+                return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+            with transaction.atomic():
+                wallet_transaction = WalletTransaction.objects.select_for_update().get(
+                    pk=wallet_transaction.pk,
+                )
+                wallet_transaction.metadata = {
+                    **(wallet_transaction.metadata or {}),
+                    "payment_provider": "bachs",
+                    "checkout_id": checkout["checkout_id"],
+                }
+                wallet_transaction.save(update_fields=["metadata"])
+            return Response(
+                {
+                    "authorization_url": checkout["checkout_url"],
+                    "reference": reference,
+                    "gateway": gateway,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
         callback_url = f"{settings.SPENDSTACK_FRONTEND_URL}/dashboard/lock-money?funding=return"
         try:
             data = paystack_request(
@@ -155,9 +209,43 @@ class FundingInitializeView(APIView):
             WalletTransaction.objects.filter(reference=reference).update(status=WalletTransaction.FAILED)
             logger.warning("Paystack funding initialization failed: %s", exc)
             return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        authorization_url = data.get("authorization_url")
+        if not isinstance(authorization_url, str) or not authorization_url.startswith(
+            "https://checkout.paystack.com/"
+        ):
+            WalletTransaction.objects.filter(reference=reference).update(status=WalletTransaction.FAILED)
+            logger.error("Paystack did not return a valid wallet funding checkout URL.")
+            return Response(
+                {"detail": "Paystack did not provide a valid checkout link. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
         return Response(
-            {"authorization_url": data.get("authorization_url"), "reference": reference},
+            {"authorization_url": authorization_url, "reference": reference, "gateway": gateway},
             status=status.HTTP_201_CREATED,
+        )
+
+
+class BachsFundingStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        reference = request.query_params.get("reference", "")
+        wallet_transaction = get_object_or_404(
+            WalletTransaction,
+            user=request.user,
+            reference=reference,
+            type=WalletTransaction.DEPOSIT,
+        )
+        if (wallet_transaction.metadata or {}).get("payment_provider") != "bachs":
+            return Response(
+                {"detail": "This payment does not use Bachs."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(
+            {
+                "status": wallet_transaction.status,
+                "amount": _money(wallet_transaction.amount),
+            }
         )
 
 
@@ -198,7 +286,7 @@ class PaystackWebhookView(APIView):
     authentication_classes = []
 
     def post(self, request):
-        secret_key = os.environ.get("PAYSTACK_SECRET_KEY", "")
+        secret_key = paystack_secret_key()
         signature = request.headers.get("x-paystack-signature", "")
         expected = hmac.new(secret_key.encode(), request.body, hashlib.sha512).hexdigest()
         if not secret_key or not hmac.compare_digest(signature, expected):
@@ -241,25 +329,86 @@ class PaystackWebhookView(APIView):
         return HttpResponse(status=200)
 
 
+class BachsWebhookView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        secret = os.environ.get("BACHS_WEBHOOK_SECRET", "").strip()
+        signature = request.headers.get("x-bachs-signature-v2", "")
+        if not verify_webhook_signature(signature, request.body, secret):
+            return HttpResponse(status=401)
+        try:
+            event = json.loads(request.body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return HttpResponse(status=400)
+        if not isinstance(event, dict):
+            return HttpResponse(status=400)
+
+        if event.get("type") == "collection.succeeded":
+            data = event.get("data")
+            if not isinstance(data, dict):
+                return HttpResponse(status=400)
+            reference = data.get("reference")
+            if not reference:
+                metadata = data.get("metadata")
+                transaction_id = metadata.get("wallet_transaction_id") if isinstance(metadata, dict) else None
+                if transaction_id:
+                    try:
+                        transaction_id = uuid.UUID(str(transaction_id))
+                    except (TypeError, ValueError, AttributeError):
+                        transaction_id = None
+                    if transaction_id:
+                        wallet_transaction = WalletTransaction.objects.filter(
+                            pk=transaction_id,
+                            type=WalletTransaction.DEPOSIT,
+                        ).first()
+                        reference = wallet_transaction.reference if wallet_transaction else None
+            if reference:
+                try:
+                    credited = credit_bachs_funding(reference, data)
+                except DatabaseError:
+                    logger.exception("Could not process signed Bachs funding webhook.")
+                    return HttpResponse(status=503)
+                if not credited:
+                    logger.warning("Signed Bachs collection did not match a pending wallet funding transaction.")
+        return HttpResponse(status=200)
+
+
 class BankDirectoryView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         try:
-            banks = paystack_request(
-                "GET",
-                "/bank",
-                params={"country": "nigeria", "perPage": 100, "use_cursor": "false"},
-            )
+            page_size = 100
+            max_pages = 20
+            banks_by_code = {}
+            for page in range(1, max_pages + 1):
+                banks = paystack_request(
+                    "GET",
+                    "/bank",
+                    params={
+                        "country": "nigeria",
+                        "perPage": page_size,
+                        "page": page,
+                        "use_cursor": "false",
+                    },
+                )
+                if not isinstance(banks, list):
+                    raise PaystackError("Paystack returned an invalid Nigerian bank directory.")
+                for bank in banks:
+                    if not isinstance(bank, dict):
+                        continue
+                    name, code = bank.get("name"), bank.get("code")
+                    if isinstance(name, str) and name and isinstance(code, str) and code:
+                        banks_by_code.setdefault(code, {"name": name, "code": code})
+                if len(banks) < page_size:
+                    break
+            else:
+                raise PaystackError("Paystack bank directory pagination did not complete.")
         except PaystackError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
-        return Response(
-            [
-                {"name": bank["name"], "code": bank["code"]}
-                for bank in banks
-                if bank.get("name") and bank.get("code")
-            ]
-        )
+        return Response(list(banks_by_code.values()))
 
 
 class BankAccountListView(APIView):
