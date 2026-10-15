@@ -19,6 +19,7 @@ class DashboardTransactionsView(APIView):
                 "id": t.id,
                 "name": t.merchant_name or t.raw_description[:30],
                 "amount": float(t.amount),
+                "currency": t.currency or "NGN",
                 "date": t.date.strftime('%b %d, %Y'),
                 "category": t.category.name if t.category else 'Uncategorized',
                 "status": "completed" if not t.is_pending else "pending",

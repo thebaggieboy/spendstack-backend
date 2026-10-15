@@ -1,10 +1,14 @@
 import uuid
+from calendar import monthrange
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.db import transaction
 from django.utils import timezone
 
-from .models import LockPeriod, PayoutAttempt, Schedule, Wallet, WalletTransaction
+from .bachs import BachsError, create_payout, get_payout_destination
+from .models import BankAccount, LockPeriod, PayoutAttempt, Schedule, Wallet, WalletTransaction
 from .paystack import PaystackError, paystack_request
 
 
@@ -13,6 +17,34 @@ KOBO_PER_NAIRA = Decimal("100")
 
 def to_kobo(amount):
     return int((Decimal(amount) * KOBO_PER_NAIRA).quantize(Decimal("1")))
+
+
+def next_occurrence(current, recurrence, timezone_name):
+    if recurrence not in (Schedule.DAILY, Schedule.WEEKLY, Schedule.MONTHLY):
+        return None
+    zone = ZoneInfo(timezone_name)
+    local = current.astimezone(zone)
+    naive = local.replace(tzinfo=None)
+    if recurrence == Schedule.DAILY:
+        naive += timedelta(days=1)
+    elif recurrence == Schedule.WEEKLY:
+        naive += timedelta(weeks=1)
+    else:
+        month = naive.month % 12 + 1
+        year = naive.year + (naive.month == 12)
+        naive = naive.replace(
+            year=year,
+            month=month,
+            day=min(naive.day, monthrange(year, month)[1]),
+        )
+
+    for _ in range(181):
+        for fold in (0, 1):
+            candidate = naive.replace(tzinfo=zone, fold=fold)
+            if candidate.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None) == naive:
+                return candidate
+        naive += timedelta(minutes=1)
+    raise ValueError("Could not resolve the next local payout time.")
 
 
 def credit_verified_funding(reference, verified_data):
@@ -27,15 +59,20 @@ def credit_verified_funding(reference, verified_data):
             return False
         if wallet_transaction.status == WalletTransaction.COMPLETED:
             return True
+        if wallet_transaction.status != WalletTransaction.PENDING:
+            return False
 
         expected_kobo = to_kobo(wallet_transaction.amount)
         if verified_data.get("status") != "success":
             return False
+        customer = verified_data.get("customer")
+        if not isinstance(customer, dict):
+            customer = {}
         if (
             verified_data.get("currency") != "NGN"
             or verified_data.get("amount") != expected_kobo
             or verified_data.get("reference") != reference
-            or verified_data.get("customer", {}).get("email", "").lower()
+            or str(customer.get("email", "")).lower()
             != wallet_transaction.user.email.lower()
         ):
             wallet_transaction.status = WalletTransaction.FAILED
@@ -84,6 +121,8 @@ def credit_bachs_funding(reference, event_data):
             return False
         if wallet_transaction.status == WalletTransaction.COMPLETED:
             return True
+        if wallet_transaction.status != WalletTransaction.PENDING:
+            return False
 
         try:
             amount = Decimal(str(event_data.get("amount", "")))
@@ -133,6 +172,109 @@ def credit_bachs_funding(reference, event_data):
             ]
         )
         return True
+
+
+def fail_pending_funding(reference, provider):
+    with transaction.atomic():
+        wallet_transaction = (
+            WalletTransaction.objects.select_for_update()
+            .filter(
+                reference=reference,
+                type=WalletTransaction.DEPOSIT,
+                status=WalletTransaction.PENDING,
+            )
+            .first()
+        )
+        if not wallet_transaction:
+            return False
+        if provider == Schedule.BACHS:
+            if (wallet_transaction.metadata or {}).get("payment_provider") != Schedule.BACHS:
+                return False
+        elif (wallet_transaction.metadata or {}).get("payment_provider", Schedule.PAYSTACK) != Schedule.PAYSTACK:
+            return False
+        wallet_transaction.status = WalletTransaction.FAILED
+        wallet_transaction.metadata = {
+            **(wallet_transaction.metadata or {}),
+            "verification": "provider_confirmed_failure",
+        }
+        wallet_transaction.completed_at = timezone.now()
+        wallet_transaction.save(update_fields=["status", "metadata", "completed_at"])
+        return True
+
+
+def _settle_payout_attempt(attempt, schedule, lock_period, *, succeeded, failure_reason=""):
+    now = timezone.now()
+    wallet = Wallet.objects.select_for_update().get(user=schedule.user)
+    if succeeded:
+        if attempt.status == "reversed":
+            return False
+        if attempt.status == Schedule.COMPLETED:
+            return True
+        if schedule.remaining_amount < attempt.amount or wallet.locked_balance < attempt.amount:
+            return False
+
+        locked_before = wallet.locked_balance
+        wallet.locked_balance -= attempt.amount
+        schedule.remaining_amount -= attempt.amount
+        wallet.save(update_fields=["locked_balance", "updated_at"])
+        attempt.status = Schedule.COMPLETED
+        attempt.completed_at = now
+        schedule.executed_at = now
+        if schedule.remaining_amount > 0 and schedule.recurrence:
+            schedule.scheduled_date = next_occurrence(
+                schedule.scheduled_date,
+                schedule.recurrence,
+                schedule.timezone_name,
+            )
+            schedule.status = Schedule.PENDING
+            lock_period.status = LockPeriod.LOCKED
+        else:
+            schedule.remaining_amount = Decimal("0.00")
+            schedule.status = Schedule.COMPLETED
+            lock_period.status = LockPeriod.UNLOCKED
+            lock_period.actual_unlock_date = now
+        attempt.save(update_fields=["status", "completed_at"])
+        schedule.save(
+            update_fields=[
+                "remaining_amount",
+                "scheduled_date",
+                "status",
+                "executed_at",
+            ]
+        )
+        lock_period.save(update_fields=["status", "actual_unlock_date"])
+        WalletTransaction.objects.create(
+            user=schedule.user,
+            type=WalletTransaction.TRANSFER,
+            amount=attempt.amount,
+            balance_before=wallet.available_balance,
+            balance_after=wallet.available_balance,
+            status=WalletTransaction.COMPLETED,
+            reference=f"transfer-{attempt.reference}",
+            description=f"Payout for {schedule.title}",
+            metadata={
+                "schedule_id": str(schedule.id),
+                "attempt_id": str(attempt.id),
+                "provider": attempt.provider,
+                "provider_reference": attempt.provider_reference or attempt.reference,
+                "locked_balance_before": str(locked_before),
+                "locked_balance_after": str(wallet.locked_balance),
+            },
+            completed_at=now,
+        )
+        return True
+
+    if attempt.status in (Schedule.COMPLETED, "reversed"):
+        return False
+    attempt.status = Schedule.FAILED
+    attempt.failure_reason = failure_reason[:255]
+    attempt.completed_at = now
+    schedule.status = Schedule.FAILED
+    lock_period.status = LockPeriod.LOCKED
+    attempt.save(update_fields=["status", "failure_reason", "completed_at"])
+    schedule.save(update_fields=["status"])
+    lock_period.save(update_fields=["status"])
+    return True
 
 
 def finalize_payout_attempt(reference, event, data):

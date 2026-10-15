@@ -46,3 +46,23 @@ class StatementPreview(models.Model):
     @property
     def is_expired(self):
         return self.expires_at <= timezone.now()
+
+
+class StatementImportAttempt(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="statement_import_attempts",
+    )
+    filename = models.CharField(max_length=255)
+    status = models.CharField(max_length=20, default="failed")
+    detail = models.CharField(max_length=500, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["user", "status", "created_at"],
+                name="stmt_imp_user_status_idx",
+            )
+        ]

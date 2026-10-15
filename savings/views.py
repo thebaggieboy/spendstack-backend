@@ -7,6 +7,7 @@ import uuid
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 
+import requests
 from django.conf import settings
 from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import Sum
@@ -379,35 +380,65 @@ class BankDirectoryView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        bank_list_api = os.environ.get(
+            "BANK_LIST",
+            "https://api.paystack.co/bank?currency=NGN&enabled_for_verification=true",
+        ).strip()
+        verifyme_secret_key = paystack_secret_key()
+        if not verifyme_secret_key:
+            return Response(
+                {"detail": "Paystack is not configured on the server."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
         try:
-            page_size = 100
-            max_pages = 20
-            banks_by_code = {}
-            for page in range(1, max_pages + 1):
-                banks = paystack_request(
-                    "GET",
-                    "/bank",
-                    params={
-                        "country": "nigeria",
-                        "perPage": page_size,
-                        "page": page,
-                        "use_cursor": "false",
-                    },
-                )
-                if not isinstance(banks, list):
-                    raise PaystackError("Paystack returned an invalid Nigerian bank directory.")
-                for bank in banks:
-                    if not isinstance(bank, dict):
-                        continue
-                    name, code = bank.get("name"), bank.get("code")
-                    if isinstance(name, str) and name and isinstance(code, str) and code:
-                        banks_by_code.setdefault(code, {"name": name, "code": code})
-                if len(banks) < page_size:
-                    break
-            else:
-                raise PaystackError("Paystack bank directory pagination did not complete.")
-        except PaystackError as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+            response = requests.get(
+                bank_list_api,
+                headers={"Authorization": f"Bearer {verifyme_secret_key}"},
+                timeout=(5, 20),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException:
+            logger.exception("Could not retrieve the Paystack bank directory.")
+            return Response(
+                {"detail": "Could not retrieve the bank list from Paystack. Please try again later."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except ValueError:
+            logger.exception("Paystack returned invalid JSON for the bank directory.")
+            return Response(
+                {"detail": "Paystack returned an invalid bank list."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        if not isinstance(payload, dict) or payload.get("status") not in ("success", True):
+            logger.warning("Paystack returned an unsuccessful or malformed bank-directory response.")
+            return Response(
+                {"detail": "Paystack returned an invalid bank list."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        banks = payload.get("data", payload.get("banks"))
+        if not isinstance(banks, list):
+            logger.warning("Paystack bank-directory response did not contain a bank list.")
+            return Response(
+                {"detail": "Paystack returned an invalid bank list."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        banks_by_code = {}
+        for bank in banks:
+            if not isinstance(bank, dict):
+                continue
+            name, code = bank.get("name"), bank.get("code")
+            if isinstance(name, str) and name.strip() and isinstance(code, (str, int)):
+                normalized_code = str(code).strip()
+                if normalized_code:
+                    banks_by_code.setdefault(
+                        normalized_code,
+                        {"name": name.strip(), "code": normalized_code},
+                    )
         return Response(list(banks_by_code.values()))
 
 

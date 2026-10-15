@@ -31,7 +31,9 @@ class BankAccount(models.Model):
     bank_code = models.CharField(max_length=20)
     account_name = models.CharField(max_length=160)
     account_last4 = models.CharField(max_length=4)
-    recipient_code = models.CharField(max_length=80, unique=True)
+    recipient_code = models.CharField(max_length=80, unique=True, null=True, blank=True)
+    bachs_destination_id = models.CharField(max_length=80, unique=True, null=True, blank=True)
+    bachs_is_usable = models.BooleanField(default=False)
     is_default = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -43,8 +45,9 @@ class WalletTransaction(models.Model):
     DEPOSIT = "deposit"
     LOCK = "lock"
     UNLOCK = "unlock"
+    TRANSFER = "transfer"
     REVERSAL = "reversal"
-    TYPES = [(value, value.title()) for value in (DEPOSIT, LOCK, UNLOCK, REVERSAL)]
+    TYPES = [(value, value.title()) for value in (DEPOSIT, LOCK, UNLOCK, TRANSFER, REVERSAL)]
 
     PENDING = "pending"
     COMPLETED = "completed"
@@ -81,7 +84,8 @@ class LockPeriod(models.Model):
     LOCKED = "locked"
     PENDING = "pending"
     UNLOCKED = "unlocked"
-    STATUSES = [(value, value.title()) for value in (LOCKED, PENDING, UNLOCKED)]
+    CANCELLED = "cancelled"
+    STATUSES = [(value, value.title()) for value in (LOCKED, PENDING, UNLOCKED, CANCELLED)]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
@@ -120,10 +124,22 @@ class Schedule(models.Model):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    PAUSED = "paused"
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    PAYSTACK = "paystack"
+    BACHS = "bachs"
     STATUSES = [
         (value, value.replace("_", " ").title())
-        for value in (PENDING, PROCESSING, REQUIRES_ACTION, COMPLETED, FAILED, CANCELLED)
+        for value in (PENDING, PROCESSING, REQUIRES_ACTION, COMPLETED, FAILED, CANCELLED, PAUSED)
     ]
+    RECURRENCES = [
+        (DAILY, "Daily"),
+        (WEEKLY, "Weekly"),
+        (MONTHLY, "Monthly"),
+    ]
+    PAYOUT_PROVIDERS = [(PAYSTACK, "Paystack"), (BACHS, "Bachs")]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
@@ -144,9 +160,12 @@ class Schedule(models.Model):
     title = models.CharField(max_length=120)
     amount = models.DecimalField(max_digits=15, decimal_places=2)
     payout_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    remaining_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     scheduled_date = models.DateTimeField()
     status = models.CharField(max_length=24, choices=STATUSES, default=PENDING)
-    recurrence = models.CharField(max_length=20, null=True, blank=True)
+    recurrence = models.CharField(max_length=20, choices=RECURRENCES, null=True, blank=True)
+    timezone_name = models.CharField(max_length=64, default="UTC")
+    payout_provider = models.CharField(max_length=12, choices=PAYOUT_PROVIDERS, default=PAYSTACK)
     auto_payout = models.BooleanField(default=True)
     reference = models.CharField(max_length=100, null=True, blank=True, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -171,6 +190,9 @@ class PayoutAttempt(models.Model):
     transfer_code = models.CharField(max_length=100, blank=True)
     status = models.CharField(max_length=24, default=Schedule.PROCESSING)
     amount = models.DecimalField(max_digits=15, decimal_places=2)
+    provider = models.CharField(max_length=12, choices=Schedule.PAYOUT_PROVIDERS, default=Schedule.PAYSTACK)
+    provider_reference = models.CharField(max_length=100, null=True, blank=True)
+    failure_reason = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 

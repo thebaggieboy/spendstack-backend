@@ -10,7 +10,7 @@ from rest_framework.permissions import IsAuthenticated
 from collections import defaultdict
 import calendar
 from transactions.models import Transaction
-from .views import confirmed_non_transfer_transactions
+from .views import confirmed_non_transfer_transactions, latest_statement_report
 
 
 CENT = Decimal("0.01")
@@ -69,12 +69,12 @@ class SpendingInsightsView(APIView):
             )
 
         expense_qs = txs.filter(amount__lt=0)
-        income_qs = txs.filter(amount__gt=0)
 
         # ── Basic counts ────────────────────────────────────────────────────
-        expense_txn_count = expense_qs.count()
-        income_txn_count = income_qs.count()
-        total_txn_count = expense_txn_count + income_txn_count
+        spending_expense_txn_count = expense_qs.count()
+        income_txn_count = all_confirmed.filter(amount__gt=0).count()
+        expense_txn_count = all_confirmed.filter(amount__lt=0).count()
+        total_txn_count = all_confirmed.count()
 
         # ── Avg daily spend ─────────────────────────────────────────────────
         # Group expenses by date → sum per day → average of those sums
@@ -182,6 +182,7 @@ class SpendingInsightsView(APIView):
             'total_txn_count': total_txn_count,
             'income_txn_count': income_txn_count,
             'expense_txn_count': expense_txn_count,
+            'spending_expense_txn_count': spending_expense_txn_count,
             'unique_merchants': unique_merchants,
             'no_spend_days': no_spend_days,
             'top_category': top_category,
@@ -195,7 +196,7 @@ class SpendingInsightsView(APIView):
 
 class MonthlyTrendView(APIView):
     """
-    Returns income and expenses aggregated by calendar month,
+    Returns posted credits and debits aggregated by calendar month,
     ordered chronologically. Used for the monthly bar chart.
 
     Each item: { month: "Jan 2025", income: float, expenses: float, net: float }
@@ -204,7 +205,7 @@ class MonthlyTrendView(APIView):
 
     def get(self, request):
         user_id = request.user.id
-        txs = confirmed_non_transfer_transactions(user_id)
+        txs = Transaction.objects.filter(user_id=user_id, is_pending=False)
 
         if not txs.exists():
             return Response([])
@@ -250,9 +251,9 @@ class MonthlyComparisonView(APIView):
         )
 
         def summarize(start, end):
-            period_transactions = confirmed_non_transfer_transactions(
-                request.user.id,
-            ).filter(
+            period_transactions = Transaction.objects.filter(
+                user_id=request.user.id,
+                is_pending=False,
                 date__gte=start,
                 date__lte=end,
             )
@@ -260,20 +261,38 @@ class MonthlyComparisonView(APIView):
                 income=Sum("amount", filter=Q(amount__gt=0)),
                 expenses=Sum("amount", filter=Q(amount__lt=0)),
             )
-            categories = period_transactions.filter(amount__lt=0).values(
+            categories = confirmed_non_transfer_transactions(request.user.id).filter(
+                date__gte=start,
+                date__lte=end,
+                amount__lt=0,
+            ).values(
                 category_name=F("category__name")
             ).annotate(total=Sum("amount"))
             return (
                 abs(totals["expenses"] or Decimal("0.00")),
                 totals["income"] or Decimal("0.00"),
+                period_transactions.filter(amount__lt=0).count(),
+                period_transactions.filter(amount__gt=0).count(),
                 {
                     row["category_name"] or "Uncategorized": abs(row["total"] or Decimal("0.00"))
                     for row in categories
                 },
             )
 
-        current_expenses, current_income, current_categories = summarize(current_start, today)
-        previous_expenses, previous_income, previous_categories = summarize(previous_month, previous_end)
+        (
+            current_expenses,
+            current_income,
+            current_debit_count,
+            current_credit_count,
+            current_categories,
+        ) = summarize(current_start, today)
+        (
+            previous_expenses,
+            previous_income,
+            previous_debit_count,
+            previous_credit_count,
+            previous_categories,
+        ) = summarize(previous_month, previous_end)
 
         def change(current, previous):
             amount = _round_decimal(current - previous, CENT)
@@ -305,6 +324,7 @@ class MonthlyComparisonView(APIView):
         return Response({
             "current_period": {"start": current_start.isoformat(), "end": today.isoformat()},
             "previous_period": {"start": previous_month.isoformat(), "end": previous_end.isoformat()},
+            "latest_statement_metrics": latest_statement_report(request.user.id),
             "expenses": {
                 "current": float(_round_decimal(current_expenses, CENT)),
                 "previous": float(_round_decimal(previous_expenses, CENT)),
@@ -314,6 +334,10 @@ class MonthlyComparisonView(APIView):
                 "current": float(_round_decimal(current_income, CENT)),
                 "previous": float(_round_decimal(previous_income, CENT)),
                 "change": change(current_income, previous_income),
+            },
+            "transaction_counts": {
+                "debits": {"current": current_debit_count, "previous": previous_debit_count},
+                "credits": {"current": current_credit_count, "previous": previous_credit_count},
             },
             "categories": category_comparison[:5],
         })

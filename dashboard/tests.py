@@ -7,8 +7,8 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from analysis.models import Statement
-from transactions.models import Category, Transaction
+from analysis.models import Statement, StatementImportAttempt
+from transactions.models import Account, Category, Transaction
 
 
 class StatementChatApiTests(TestCase):
@@ -77,7 +77,7 @@ class StatementChatApiTests(TestCase):
         response = self.client.post("/api/dashboard/chat/", {"question": "  "}, format="json")
         self.assertEqual(response.status_code, 400)
 
-    def test_overview_uses_exact_confirmed_cash_totals_and_never_calls_net_flow_a_balance(self):
+    def test_overview_includes_transfer_totals_but_excludes_pending_rows(self):
         Transaction.objects.create(
             user=self.user,
             date=date(2026, 10, 1),
@@ -126,14 +126,156 @@ class StatementChatApiTests(TestCase):
         response = self.client.get("/api/dashboard/overview/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["credits_all_time"], 300.10)
+        self.assertEqual(response.data["credits_all_time"], 500300.10)
         self.assertEqual(response.data["expenses_all_time"], 100.00)
-        self.assertEqual(response.data["net_cash_flow"], 200.10)
-        self.assertAlmostEqual(response.data["savings_rate"], 200.10 / 300.10 * 100)
+        self.assertEqual(response.data["net_cash_flow"], 500200.10)
+        self.assertAlmostEqual(response.data["savings_rate"], 500200.10 / 500300.10 * 100)
+        self.assertEqual(response.data["transaction_credits_all_time"], 500300.10)
+        self.assertFalse(response.data["statement_totals_mismatch"])
         self.assertEqual(response.data["highest_daily_spend"], 100.00)
         self.assertEqual(response.data["top_payee"], "Market")
         self.assertEqual(response.data["top_payee_amount"], 70.00)
+        self.assertEqual(response.data["latest_statement_metrics"], {
+            "opening_balance": None,
+            "closing_balance": None,
+            "total_credits": None,
+            "total_debits": None,
+            "credit_count": None,
+            "debit_count": None,
+            "filename": None,
+            "ambiguous_fields": [],
+            "incomplete_fields": [],
+            "comparison": {
+                "total_credits": {"status": "unavailable", "transaction_rows": "0.00", "difference": None},
+                "total_debits": {"status": "unavailable", "transaction_rows": "0.00", "difference": None},
+                "credit_count": {"status": "unavailable", "transaction_rows": 0, "difference": None},
+                "debit_count": {"status": "unavailable", "transaction_rows": 0, "difference": None},
+            },
+        })
         self.assertNotIn("total_balance", response.data)
+
+    def test_overview_uses_transaction_rows_and_exposes_reported_statement_discrepancies(self):
+        statement = Statement.objects.create(
+            user=self.user,
+            filename="bank.xlsx",
+            summary_data={"total_credits": "100.00", "total_debits": "200.00"},
+        )
+        statement_without_summary = Statement.objects.create(
+            user=self.user,
+            filename="additional.csv",
+        )
+        Transaction.objects.create(
+            user=self.user,
+            statement=statement,
+            date=date(2026, 10, 1),
+            amount=Decimal("120.00"),
+            raw_description="Credit",
+        )
+        Transaction.objects.create(
+            user=self.user,
+            statement=statement,
+            date=date(2026, 10, 1),
+            amount=Decimal("-180.00"),
+            raw_description="Debit",
+        )
+        Transaction.objects.create(
+            user=self.user,
+            statement=statement_without_summary,
+            date=date(2026, 10, 2),
+            amount=Decimal("50.00"),
+            raw_description="Additional credit",
+        )
+        Transaction.objects.create(
+            user=self.user,
+            statement=statement_without_summary,
+            date=date(2026, 10, 2),
+            amount=Decimal("-40.00"),
+            raw_description="Additional debit",
+        )
+
+        response = self.client.get("/api/dashboard/overview/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["credits_all_time"], 170.00)
+        self.assertEqual(response.data["expenses_all_time"], 220.00)
+        self.assertEqual(response.data["transaction_credits_all_time"], 170.00)
+        self.assertEqual(response.data["transaction_expenses_all_time"], 220.00)
+        self.assertTrue(response.data["statement_totals_mismatch"])
+        self.assertEqual(response.data["statement_totals_mismatch_fields"], ["credits", "debits"])
+        self.assertEqual(response.data["statement_totals_comparison"], {
+            "credits": {
+                "reported": 100.00,
+                "transaction_rows": 120.00,
+                "statement_count": 1,
+                "mismatch": True,
+            },
+            "debits": {
+                "reported": 200.00,
+                "transaction_rows": 180.00,
+                "statement_count": 1,
+                "mismatch": True,
+            },
+        })
+        self.assertEqual(response.data["net_cash_flow"], -50.00)
+
+    def test_overview_returns_statement_reported_balances_and_totals_separately(self):
+        statement = Statement.objects.create(
+            user=self.user,
+            filename="latest.xlsx",
+            summary_data={
+                "opening_balance": "1200.00",
+                "closing_balance": "950.00",
+                "total_credits": "400.00",
+                "total_debits": "650.00",
+                "credit_count": "3",
+                "debit_count": "7",
+            },
+        )
+        Transaction.objects.create(
+            user=self.user,
+            statement=statement,
+            date=date(2026, 10, 1),
+            amount=Decimal("390.00"),
+            raw_description="Credit row",
+        )
+
+        response = self.client.get("/api/dashboard/overview/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["latest_statement_metrics"], {
+            "opening_balance": "1200.00",
+            "closing_balance": "950.00",
+            "total_credits": "400.00",
+            "total_debits": "650.00",
+            "credit_count": "3",
+            "debit_count": "7",
+            "filename": "latest.xlsx",
+            "ambiguous_fields": [],
+            "incomplete_fields": [],
+            "comparison": {
+                "total_credits": {
+                    "status": "mismatch",
+                    "transaction_rows": "390.00",
+                    "difference": "-10.00",
+                },
+                "total_debits": {
+                    "status": "mismatch",
+                    "transaction_rows": "0.00",
+                    "difference": "-650.00",
+                },
+                "credit_count": {
+                    "status": "mismatch",
+                    "transaction_rows": 1,
+                    "difference": -2,
+                },
+                "debit_count": {
+                    "status": "mismatch",
+                    "transaction_rows": 0,
+                    "difference": -7,
+                },
+            },
+        })
+        self.assertEqual(response.data["credits_all_time"], 390.00)
 
     @patch("dashboard.views_insights.timezone.localdate", return_value=date(2026, 10, 13))
     def test_insights_filters_period_and_finds_most_frequent_transfer_recipient(self, _today):
@@ -203,7 +345,10 @@ class StatementChatApiTests(TestCase):
         self.assertEqual(response.data["top_category"], "Test food")
         self.assertEqual(response.data["top_category_amount"], 500.00)
         self.assertEqual(response.data["top_category_share_percent"], 55.6)
-        self.assertEqual(response.data["expense_txn_count"], 3)
+        self.assertEqual(response.data["expense_txn_count"], 7)
+        self.assertEqual(response.data["income_txn_count"], 0)
+        self.assertEqual(response.data["total_txn_count"], 7)
+        self.assertEqual(response.data["spending_expense_txn_count"], 3)
 
     def test_insights_rejects_unknown_period_filters(self):
         response = self.client.get("/api/dashboard/insights/?period=forever")
@@ -251,16 +396,16 @@ class StatementChatApiTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["stats"]["total_credits"], 100.10)
-        self.assertEqual(response.data["stats"]["total_expenses"], 0.10)
-        self.assertEqual(response.data["stats"]["net"], 100.00)
+        self.assertEqual(response.data["stats"]["total_expenses"], 50.10)
+        self.assertEqual(response.data["stats"]["net"], 50.00)
         self.assertEqual(
             response.data["daily_data"],
             [
                 {"date": "Oct 12, 2025", "credits": 100.10, "expenses": 0.00},
-                {"date": "Oct 12, 2026", "credits": 0.00, "expenses": 0.10},
+                {"date": "Oct 12, 2026", "credits": 0.00, "expenses": 50.10},
             ],
         )
-        self.assertEqual(response.data["transactions"][-1]["cumulative_flow"], 100.00)
+        self.assertEqual(response.data["transactions"][-1]["cumulative_flow"], 50.00)
 
     def test_cash_flow_keeps_calendar_days_from_different_years_separate(self):
         Transaction.objects.create(
@@ -282,6 +427,13 @@ class StatementChatApiTests(TestCase):
             raw_description="Pending debit",
             is_pending=True,
         )
+        Transaction.objects.create(
+            user=self.user,
+            date=date(2025, 10, 12),
+            amount=Decimal("-25.00"),
+            raw_description="Transfer",
+            is_transfer=True,
+        )
 
         response = self.client.get("/api/dashboard/cash-flow/")
 
@@ -289,13 +441,13 @@ class StatementChatApiTests(TestCase):
         self.assertEqual(
             response.data,
             [
-                {"date": "2025-10-12", "income": 100.00, "expenses": 0.00},
+                {"date": "2025-10-12", "income": 100.00, "expenses": 25.00},
                 {"date": "2026-10-12", "income": 0.00, "expenses": 50.00},
             ],
         )
 
     @patch("dashboard.views_insights.timezone.localdate", return_value=date(2026, 3, 15))
-    def test_monthly_comparison_uses_matching_days_and_excludes_transfers(self, _today):
+    def test_monthly_comparison_includes_transfers_but_categories_exclude_them(self, _today):
         category = Category.objects.create(name="Comparison dining")
         Transaction.objects.create(
             user=self.user,
@@ -335,7 +487,111 @@ class StatementChatApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["current_period"], {"start": "2026-03-01", "end": "2026-03-15"})
         self.assertEqual(response.data["previous_period"], {"start": "2026-02-01", "end": "2026-02-15"})
-        self.assertEqual(response.data["expenses"]["current"], 500.0)
+        self.assertEqual(response.data["expenses"]["current"], 10499.0)
         self.assertEqual(response.data["expenses"]["previous"], 300.0)
-        self.assertEqual(response.data["expenses"]["change"]["percent"], 66.7)
+        self.assertEqual(response.data["expenses"]["change"]["amount"], 10199.0)
         self.assertEqual(response.data["categories"][0]["category"], "Comparison dining")
+        self.assertEqual(response.data["categories"][0]["current"], 500.0)
+        self.assertEqual(response.data["transaction_counts"], {
+            "debits": {"current": 2, "previous": 1},
+            "credits": {"current": 0, "previous": 0},
+        })
+
+    def test_monthly_trend_includes_transfers_and_excludes_pending_transactions(self):
+        Transaction.objects.create(
+            user=self.user,
+            date=date(2026, 10, 2),
+            amount=Decimal("-100.00"),
+            raw_description="Purchase",
+        )
+        Transaction.objects.create(
+            user=self.user,
+            date=date(2026, 10, 2),
+            amount=Decimal("-50.00"),
+            raw_description="Transfer",
+            is_transfer=True,
+        )
+        Transaction.objects.create(
+            user=self.user,
+            date=date(2026, 10, 3),
+            amount=Decimal("-900.00"),
+            raw_description="Pending purchase",
+            is_pending=True,
+        )
+
+        response = self.client.get("/api/dashboard/monthly-trend/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data[0]["expenses"], 150.00)
+        self.assertEqual(response.data[0]["net"], -150.00)
+
+    @patch("dashboard.views.timezone.localdate", return_value=date(2026, 10, 15))
+    def test_overview_groups_balances_and_cash_flow_by_currency_and_reports_attention(self, _today):
+        usd_account = Account.objects.create(user=self.user, name="USD checking")
+        eur_account = Account.objects.create(user=self.user, name="EUR checking")
+        usd_statement = Statement.objects.create(
+            user=self.user,
+            filename="usd.csv",
+            summary_data={"currency": "USD", "closing_balance": "1000.00"},
+        )
+        eur_statement = Statement.objects.create(
+            user=self.user,
+            filename="eur.csv",
+            summary_data={"currency": "EUR", "closing_balance": "900.00"},
+        )
+        Transaction.objects.create(
+            user=self.user,
+            account=usd_account,
+            statement=usd_statement,
+            date=date(2026, 10, 2),
+            amount=Decimal("100.00"),
+            currency="USD",
+            raw_description="Salary",
+        )
+        Transaction.objects.create(
+            user=self.user,
+            account=usd_account,
+            statement=usd_statement,
+            date=date(2026, 10, 3),
+            amount=Decimal("-20.00"),
+            currency="USD",
+            raw_description="Purchase",
+        )
+        Transaction.objects.create(
+            user=self.user,
+            account=usd_account,
+            statement=usd_statement,
+            date=date(2026, 9, 3),
+            amount=Decimal("50.00"),
+            currency="USD",
+            raw_description="Previous salary",
+        )
+        Transaction.objects.create(
+            user=self.user,
+            account=eur_account,
+            statement=eur_statement,
+            date=date(2026, 10, 4),
+            amount=Decimal("200.00"),
+            currency="EUR",
+            raw_description="Salary",
+        )
+        StatementImportAttempt.objects.create(
+            user=self.user,
+            filename="broken.csv",
+            status="failed",
+            detail="Invalid statement",
+        )
+
+        response = self.client.get("/api/dashboard/overview/?period=month")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["period"]["start"], "2026-10-01")
+        flows = {row["currency"]: row for row in response.data["cash_flow_by_currency"]}
+        self.assertEqual(flows["USD"]["income"], "100.00")
+        self.assertEqual(flows["USD"]["spending"], "20.00")
+        self.assertEqual(flows["USD"]["previous_net"], "50.00")
+        self.assertEqual(flows["EUR"]["income"], "200.00")
+        balances = {row["currency"]: row["amount"] for row in response.data["current_balances"]}
+        self.assertEqual(balances, {"EUR": "900.00", "USD": "1000.00"})
+        self.assertEqual(response.data["attention_needed"]["failed_imports"], 1)
+        self.assertEqual(response.data["attention_needed"]["uncategorized_transactions"], 4)

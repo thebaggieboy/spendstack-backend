@@ -19,19 +19,27 @@ _CREDIT_HEADERS = ("credit", "deposit", "lodgement", "money in", "inflow", "paid
 _DIRECTION_HEADERS = ("dr/cr", "debit/credit", "type", "direction")
 _STATEMENT_SUMMARY_LABELS = {
     "opening_balance": re.compile(
-        r"^\s*(?:opening balance|balance b\s*/\s*f|balance brought forward|brought forward balance)\b",
+        r"\b(?:opening balance|balance b\s*/\s*f|balance brought forward|brought forward balance)\b",
         re.I,
     ),
     "closing_balance": re.compile(
-        r"^\s*(?:closing balance|balance c\s*/\s*f|balance carried forward|carried forward balance)\b",
+        r"\b(?:closing balance|balance c\s*/\s*f|balance carried forward|carried forward balance)\b",
+        re.I,
+    ),
+    "credit_count": re.compile(
+        r"\b(?:credit count|total credit count|number of credits?|no\.?\s*of credits?|credit transactions? count|number of credit transactions?)\b",
+        re.I,
+    ),
+    "debit_count": re.compile(
+        r"\b(?:debit count|total debit count|number of debits?|no\.?\s*of debits?|debit transactions? count|number of debit transactions?)\b",
         re.I,
     ),
     "total_credits": re.compile(
-        r"^\s*(?:total credits?|total deposits?|total lodgements?|total amount credited|total inflow)\b",
+        r"\b(?:total credits?(?!\s*(?:count|transactions?\s*count))|total deposits?|total lodgements?|total amount credited|total inflow)\b",
         re.I,
     ),
     "total_debits": re.compile(
-        r"^\s*(?:total debits?|total withdrawals?|total amount debited|total outflow)\b",
+        r"\b(?:total debits?(?!\s*(?:count|transactions?\s*count))|total withdrawals?|total amount debited|total outflow)\b",
         re.I,
     ),
 }
@@ -42,12 +50,31 @@ _SUMMARY_AMOUNT_PATTERN = re.compile(
 )
 
 
-def _summary_label(text):
+def _summary_label(text, at_start=False):
+    label_text = str(text or "")
+    if at_start:
+        label_text = label_text.lstrip()
     for field, pattern in _STATEMENT_SUMMARY_LABELS.items():
-        match = pattern.match(str(text or ""))
+        match = (
+            pattern.match(label_text)
+            if at_start
+            else pattern.search(label_text)
+        )
         if match:
             return field, match.end()
     return None, None
+
+
+def _summary_labels(text):
+    return sorted(
+        (
+            match.start(),
+            match.end(),
+            field,
+        )
+        for field, pattern in _STATEMENT_SUMMARY_LABELS.items()
+        for match in pattern.finditer(str(text or ""))
+    )
 
 
 def _summary_amount(value):
@@ -68,40 +95,62 @@ def _summary_amount(value):
         return None
 
 
-def _collect_summary_values(rows):
+def _collect_summary_values(rows, allow_embedded_labels=False):
     found = {field: set() for field in _STATEMENT_SUMMARY_LABELS}
     for row in rows:
         cells = [str(value).strip() for value in row]
-        labels = [
-            (index, *_summary_label(value))
-            for index, value in enumerate(cells)
-        ]
-        for index, field, label_end in labels:
-            if not field:
-                continue
+        labels = []
+        for index, value in enumerate(cells):
+            if allow_embedded_labels:
+                labels.extend(
+                    (index, start, end, field)
+                    for start, end, field in _summary_labels(value)
+                )
+            else:
+                field, label_end = _summary_label(value, at_start=True)
+                if field:
+                    labels.append((index, 0, label_end, field))
+        labels.sort(key=lambda label: (label[0], label[1]))
+        for label_index, (index, _, label_end, field) in enumerate(labels):
+            next_label = labels[label_index + 1] if label_index + 1 < len(labels) else None
+            if next_label and next_label[0] == index:
+                fragments = [cells[index][label_end:next_label[1]]]
+            else:
+                next_label_index = next_label[0] if next_label else len(cells)
+                fragments = [cells[index][label_end:]]
+                fragments.extend(cells[index + 1:next_label_index])
+
             amount = None
-            remainder = cells[index][label_end:]
-            matches = list(_SUMMARY_AMOUNT_PATTERN.finditer(remainder))
-            if matches:
-                amount = _summary_amount(matches[-1].group(0))
-            if amount is None:
-                neighboring = sorted(
-                    (
-                        (abs(other_index - index), other_index, _summary_amount(value))
-                        for other_index, value in enumerate(cells)
-                        if other_index != index
-                    ),
-                    key=lambda item: (item[0], item[1]),
-                )
-                amount = next(
-                    (candidate for _, _, candidate in neighboring if candidate is not None),
-                    None,
-                )
+            for fragment in fragments:
+                for candidate in _SUMMARY_AMOUNT_PATTERN.finditer(fragment):
+                    amount = _summary_amount(candidate.group(0))
+                    if amount is not None:
+                        break
+                if amount is not None:
+                    break
             if amount is not None:
                 if field in ("total_credits", "total_debits"):
                     amount = abs(amount)
-                found[field].add(str(amount.quantize(Decimal("0.01"))))
+                if field in ("credit_count", "debit_count"):
+                    if amount < 0 or amount != amount.to_integral_value():
+                        continue
+                    found[field].add(str(int(amount)))
+                else:
+                    found[field].add(str(amount.quantize(Decimal("0.01"))))
     return found
+
+
+def _resolve_summary_values(values):
+    summary = {}
+    ambiguous_fields = []
+    for field, candidates in values.items():
+        if len(candidates) == 1:
+            summary[field] = next(iter(candidates))
+        elif len(candidates) > 1:
+            ambiguous_fields.append(field)
+    if ambiguous_fields:
+        summary["ambiguous_fields"] = sorted(ambiguous_fields)
+    return summary
 
 
 def extract_statement_summary(file_content, filename):
@@ -116,7 +165,7 @@ def extract_statement_summary(file_content, filename):
                 decoded = file_content.decode(encoding)
         except UnicodeDecodeError as exc:
             raise ValueError("Could not decode the statement while checking its balance summary.") from exc
-        rows = list(csv.reader(io.StringIO(decoded), delimiter=_detect_delimiter(decoded[:8192])))
+        rows = csv.reader(io.StringIO(decoded), delimiter=_detect_delimiter(decoded[:8192]))
         values = _collect_summary_values(rows)
     elif extension in ("xlsx", "xls"):
         try:
@@ -129,12 +178,63 @@ def extract_statement_summary(file_content, filename):
             )
         except Exception as exc:
             raise ValueError(f"Could not inspect the statement balance summary: {exc}") from exc
-        collected = {field: set() for field in _STATEMENT_SUMMARY_LABELS}
-        for frame in workbook.values():
-            sheet_values = _collect_summary_values(frame.itertuples(index=False, name=None))
-            for field, candidates in sheet_values.items():
-                collected[field].update(candidates)
-        values = collected
+        sheet_values = {
+            str(sheet_name): _collect_summary_values(frame.itertuples(index=False, name=None))
+            for sheet_name, frame in workbook.items()
+        }
+        transaction_sheets = [
+            str(sheet_name)
+            for sheet_name, frame in workbook.items()
+            if _find_header(frame)[0] is not None
+        ]
+        transaction_summaries = [
+            (sheet_name, sheet_values[sheet_name])
+            for sheet_name in transaction_sheets
+        ]
+        if any(any(candidates.values()) for _, candidates in transaction_summaries):
+            relevant_summaries = transaction_summaries
+        else:
+            relevant_summaries = [
+                (sheet_name, candidates)
+                for sheet_name, candidates in sheet_values.items()
+                if any(candidates.values())
+            ]
+
+        summary = {}
+        ambiguous_fields = set()
+        incomplete_fields = set()
+        for field in _STATEMENT_SUMMARY_LABELS:
+            if not relevant_summaries:
+                continue
+            field_values = [candidates[field] for _, candidates in relevant_summaries]
+            if any(len(candidates) > 1 for candidates in field_values):
+                ambiguous_fields.add(field)
+            elif any(not candidates for candidates in field_values):
+                if any(field_values):
+                    incomplete_fields.add(field)
+            else:
+                total = sum(
+                    (Decimal(next(iter(candidates))) for candidates in field_values),
+                    Decimal("0.00"),
+                )
+                summary[field] = (
+                    str(int(total))
+                    if field in ("credit_count", "debit_count")
+                    else str(total.quantize(Decimal("0.01")))
+                )
+        if ambiguous_fields:
+            summary["ambiguous_fields"] = sorted(ambiguous_fields)
+        if incomplete_fields:
+            summary["incomplete_fields"] = sorted(incomplete_fields)
+        if len(relevant_summaries) > 1:
+            summary["sheet_summaries"] = [
+                {
+                    "sheet": sheet_name,
+                    **_resolve_summary_values(candidates),
+                }
+                for sheet_name, candidates in relevant_summaries
+            ]
+        return summary
     elif extension == "pdf":
         try:
             with pdfplumber.open(io.BytesIO(file_content)) as pdf:
@@ -142,21 +242,70 @@ def extract_statement_summary(file_content, filename):
         except Exception:
             pages = _extract_pdfium_text(file_content)
         values = _collect_summary_values(
-            line.split("|") for _, text in pages for line in text.splitlines()
+                (line.split("|") for _, text in pages for line in text.splitlines()),
+                allow_embedded_labels=True,
+            )
+    elif extension == "txt":
+        try:
+            text = file_content.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Could not decode the text statement.") from exc
+        values = _collect_summary_values(
+            (line.split("|") for line in text.splitlines()),
+            allow_embedded_labels=True,
         )
+        summary = _resolve_summary_values(values)
+        currency = re.search(r"^\s*Currency\s*:\s*([A-Z]{3})\s*$", text, re.I | re.M)
+        if currency:
+            summary["currency"] = currency.group(1).upper()
+        return summary
     else:
         return {}
 
-    summary = {}
-    ambiguous_fields = []
-    for field, candidates in values.items():
-        if len(candidates) == 1:
-            summary[field] = next(iter(candidates))
-        elif len(candidates) > 1:
-            ambiguous_fields.append(field)
-    if ambiguous_fields:
-        summary["ambiguous_fields"] = sorted(ambiguous_fields)
-    return summary
+    return _resolve_summary_values(values)
+
+
+def parse_text_statement_detailed(file_content):
+    """Parse pipe-delimited text statements with explicit transaction directions."""
+    try:
+        text = file_content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Failed to decode text statement: {exc}") from exc
+    currency_match = re.search(r"^\s*Currency\s*:\s*([A-Z]{3})\s*$", text, re.I | re.M)
+    currency = currency_match.group(1).upper() if currency_match else None
+    transactions = []
+    warnings = []
+    for row_number, line in enumerate(text.splitlines(), start=1):
+        if "|" not in line:
+            continue
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) != 4:
+            warnings.append(_row_warning(None, row_number, "expected date, description, amount, and type"))
+            continue
+        date_text, description, amount_text, direction = fields
+        try:
+            parsed_date = _parse_date(date_text)
+            amount = _parse_amount(amount_text)
+            direction = _normalize_header(direction)
+            if amount is None or not description:
+                raise ValueError("missing transaction field")
+            if direction not in ("credit", "debit"):
+                raise ValueError("unrecognized debit/credit indicator")
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            warnings.append(_row_warning(None, row_number, "invalid date, description, amount, or type"))
+            continue
+        transactions.append({
+            "date": parsed_date,
+            "raw_description": description,
+            "amount": abs(amount) if direction == "credit" else -abs(amount),
+            "source_row": row_number,
+            "currency": currency,
+            "status": "posted",
+            "is_pending": False,
+        })
+    if not transactions and not warnings:
+        raise ValueError("No transaction rows were found in the text statement.")
+    return transactions, warnings
 
 
 def parse_csv_statement(file_content):
@@ -164,8 +313,8 @@ def parse_csv_statement(file_content):
     return transactions
 
 
-def parse_csv_statement_detailed(file_content):
-    """Parse a CSV statement while retaining source row numbers and row-level issues."""
+def parse_csv_statement_detailed(file_content, chunk_size=1000, progress_callback=None):
+    """Parse a CSV in bounded row batches while retaining source row numbers."""
     try:
         try:
             decoded = file_content.decode("utf-8-sig")
@@ -174,22 +323,65 @@ def parse_csv_statement_detailed(file_content):
             decoded = file_content.decode(encoding)
         delimiter = _detect_delimiter(decoded[:8192])
         reader = csv.reader(io.StringIO(decoded), delimiter=delimiter)
+        header_row = None
+        header_source_row = None
+        for record_number, row in enumerate(reader, start=1):
+            if record_number > 30:
+                break
+            if _header_score(row) == 3:
+                header_row = row
+                header_source_row = reader.line_num
+                break
+        if header_row is None:
+            raise ValueError("Could not locate transaction table headers.")
+        while header_row and not str(header_row[-1]).strip():
+            header_row.pop()
+
+        transactions = []
+        warnings = []
         rows = []
         source_rows = []
+        processed_rows = 0
+        chunk_size = max(1, int(chunk_size))
         for row in reader:
+            while row and not str(row[-1]).strip():
+                row.pop()
             rows.append(row)
             source_rows.append(reader.line_num)
-        for row in rows:
-            while row and not row[-1].strip():
-                row.pop()
-        width = max((len(row) for row in rows), default=0)
-        frame = pd.DataFrame([
-            row + [""] * (width - len(row))
-            for row in rows
-        ])
-        return _parse_tabular_statement(frame, source_rows=source_rows)
+            if len(rows) >= chunk_size:
+                chunk_transactions, chunk_warnings = _parse_csv_rows(
+                    header_row, header_source_row, rows, source_rows
+                )
+                transactions.extend(chunk_transactions)
+                warnings.extend(chunk_warnings)
+                processed_rows += len(rows)
+                if progress_callback:
+                    progress_callback(processed_rows)
+                rows = []
+                source_rows = []
+        if rows:
+            chunk_transactions, chunk_warnings = _parse_csv_rows(
+                header_row, header_source_row, rows, source_rows
+            )
+            transactions.extend(chunk_transactions)
+            warnings.extend(chunk_warnings)
+            processed_rows += len(rows)
+        if progress_callback:
+            progress_callback(processed_rows)
+        return transactions, warnings
     except (UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError, csv.Error) as exc:
         raise ValueError(f"Failed to parse CSV statement: {exc}") from exc
+
+
+def _parse_csv_rows(header_row, header_source_row, rows, source_rows):
+    width = max([len(header_row)] + [len(row) for row in rows])
+    frame = pd.DataFrame(
+        [row + [""] * (width - len(row)) for row in [header_row] + rows]
+    )
+    return _parse_tabular_statement(
+        frame,
+        source_rows=[header_source_row] + source_rows,
+    )
 
 
 def _detect_delimiter(sample):
@@ -239,6 +431,7 @@ def parse_excel_statement_detailed(file_content):
                 frame,
                 source_sheet=str(sheet_name),
                 allow_no_header=True,
+                dayfirst_dates=True,
             )
         except ValueError:
             continue
@@ -266,20 +459,31 @@ def _normalize_header(value):
 
 def _header_score(values):
     headers = [_normalize_header(value) for value in values]
-    has_date = any(
-        any(_has_alias(header, alias) for alias in _DATE_HEADERS)
-        for header in headers
+    date_columns = {
+        index for index, header in enumerate(headers)
+        if any(_has_alias(header, alias) for alias in _DATE_HEADERS)
+    }
+    description_columns = {
+        index for index, header in enumerate(headers)
+        if any(_has_alias(header, alias) for alias in _DESCRIPTION_HEADERS)
+    }
+    amount_columns = {
+        index for index, header in enumerate(headers)
+        if any(_has_alias(header, alias) for alias in _AMOUNT_HEADERS + _DEBIT_HEADERS + _CREDIT_HEADERS)
+    }
+    if any(
+        date_column != description_column
+        and date_column != amount_column
+        and description_column != amount_column
+        for date_column in date_columns
+        for description_column in description_columns
+        for amount_column in amount_columns
+    ):
+        return 3
+    return min(
+        int(bool(date_columns)) + int(bool(description_columns)) + int(bool(amount_columns)),
+        2,
     )
-    has_description = any(
-        any(_has_alias(header, alias) for alias in _DESCRIPTION_HEADERS)
-        for header in headers
-    )
-    has_amount = (
-        any(any(_has_alias(header, alias) for alias in _AMOUNT_HEADERS) for header in headers)
-        or any(any(_has_alias(header, alias) for alias in _DEBIT_HEADERS) for header in headers)
-        or any(any(_has_alias(header, alias) for alias in _CREDIT_HEADERS) for header in headers)
-    )
-    return int(has_date) + int(has_description) + int(has_amount)
 
 
 def _has_alias(header, alias):
@@ -317,7 +521,13 @@ def _select_column(columns, aliases, exclude=()):
     )
 
 
-def _parse_tabular_statement(frame, source_sheet=None, allow_no_header=False, source_rows=None):
+def _parse_tabular_statement(
+    frame,
+    source_sheet=None,
+    allow_no_header=False,
+    source_rows=None,
+    dayfirst_dates=False,
+):
     header_index, headers = _find_header(frame)
     if header_index is None:
         if allow_no_header:
@@ -343,6 +553,9 @@ def _parse_tabular_statement(frame, source_sheet=None, allow_no_header=False, so
     debit_col = _select_column(column_names, _DEBIT_HEADERS)
     credit_col = _select_column(column_names, _CREDIT_HEADERS)
     direction_col = _select_column(column_names, _DIRECTION_HEADERS)
+    status_col = _select_column(column_names, ("transaction status", "status", "state"))
+    currency_col = _select_column(column_names, ("currency", "currency code"))
+    source_id_col = _select_identifier_column(column_names)
 
     transactions = []
     warnings = []
@@ -367,7 +580,7 @@ def _parse_tabular_statement(frame, source_sheet=None, allow_no_header=False, so
         values = [value for value in row.tolist() if not _is_blank(value)]
         if not values:
             continue
-        if any(_summary_label(value)[0] for value in values):
+        if any(_summary_label(value, at_start=True)[0] for value in values):
             continue
 
         date_value = row[date_col]
@@ -381,10 +594,16 @@ def _parse_tabular_statement(frame, source_sheet=None, allow_no_header=False, so
             continue
 
         try:
-            date_value = _parse_date(date_value)
+            date_value = _parse_date(date_value, dayfirst=dayfirst_dates)
         except (ValueError, TypeError, OverflowError):
             warnings.append(_row_warning(source_sheet, row_number, "invalid date"))
             continue
+        if _has_ambiguous_slash_date(row[date_col]):
+            convention = "DD/MM/YYYY" if dayfirst_dates else "MM/DD/YYYY"
+            location = f"Sheet '{source_sheet}', row {row_number}" if source_sheet else f"Row {row_number}"
+            warnings.append(
+                f"{location}: date format is ambiguous; interpreted as {convention}."
+            )
 
         try:
             amount_value, sign_is_known = _read_row_amount(
@@ -414,11 +633,31 @@ def _parse_tabular_statement(frame, source_sheet=None, allow_no_header=False, so
             "amount": amount_value,
             "source_row": row_number,
         }
+        if status_col and not _is_blank(row[status_col]):
+            status = _normalize_header(row[status_col])
+            transaction["status"] = status
+            transaction["is_pending"] = status in ("pending", "unsettled", "authorization hold")
+        if currency_col and not _is_blank(row[currency_col]):
+            transaction["currency"] = str(row[currency_col]).strip().upper()
+        if source_id_col and not _is_blank(row[source_id_col]):
+            transaction["source_id"] = str(row[source_id_col]).strip()
         if source_sheet is not None:
             transaction["source_sheet"] = source_sheet
         transactions.append(transaction)
 
     return transactions, warnings
+
+
+def _select_identifier_column(columns):
+    aliases = ("transaction id", "transaction reference", "reference id", "reference", "id")
+    candidates = [
+        column
+        for column in columns
+        if column in aliases
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=aliases.index)
 
 
 def _is_blank(value):
@@ -430,6 +669,13 @@ def _is_blank(value):
     except (TypeError, ValueError):
         pass
     return isinstance(value, str) and not value.strip()
+
+
+def _has_ambiguous_slash_date(value):
+    if not isinstance(value, str):
+        return False
+    match = re.fullmatch(r"\s*(\d{1,2})/(\d{1,2})/(\d{2,4})\s*", value)
+    return bool(match and int(match.group(1)) <= 12 and int(match.group(2)) <= 12)
 
 
 def _has_amount_value(row, amount_col, debit_col, credit_col):
@@ -446,7 +692,7 @@ def _row_warning(sheet, row_number, reason):
     return f"{location}: {reason}; not imported."
 
 
-def _parse_date(value):
+def _parse_date(value, dayfirst=False):
     if isinstance(value, (datetime, date, pd.Timestamp)):
         return value.strftime("%Y-%m-%d")
     if isinstance(value, (int, float)) and 1 <= value <= 2958465:
@@ -459,8 +705,26 @@ def _parse_date(value):
         return date.fromisoformat(text[:10]).isoformat()
     except ValueError:
         pass
-    parsed = pd.to_datetime(text, dayfirst=True, errors="raise")
-    return parsed.strftime("%Y-%m-%d")
+    date_formats = [
+        "%d-%b-%Y",
+        "%d-%b-%y",
+        "%d %b %Y %H:%M:%S",
+        "%d %b %y %H:%M:%S",
+        "%d %b %Y",
+        "%d %b %y",
+        "%b %d, %Y",
+    ]
+    slash_formats = (
+        ("%d/%m/%Y", "%d/%m/%y", "%m/%d/%Y", "%m/%d/%y")
+        if dayfirst
+        else ("%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y", "%d/%m/%y")
+    )
+    for date_format in slash_formats + tuple(date_formats):
+        try:
+            return datetime.strptime(text, date_format).date().isoformat()
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported or ambiguous date format: {text}")
 
 
 def _read_row_amount(row, amount_col, debit_col, credit_col, direction_col, description):
@@ -591,7 +855,7 @@ def _parse_pdf_text(text):
             continue
 
         try:
-            parsed_date = _parse_date(date_match.group(0))
+            parsed_date = _parse_date(date_match.group(0), dayfirst=True)
         except (ValueError, TypeError, OverflowError):
             warnings.append(f"PDF text line {line_number}: invalid transaction date; not imported.")
             continue
@@ -653,7 +917,10 @@ def parse_pdf_statement_detailed(file_obj):
                         continue
                     frame = pd.DataFrame(table, dtype=object)
                     try:
-                        transactions, warnings = _parse_tabular_statement(frame)
+                        transactions, warnings = _parse_tabular_statement(
+                            frame,
+                            dayfirst_dates=True,
+                        )
                     except ValueError:
                         continue
                     for transaction in transactions:

@@ -331,20 +331,51 @@ class SavingsApiTests(TestCase):
         self.assertEqual(result, {"id": 123})
         self.assertEqual(request.call_args.kwargs["headers"]["Authorization"], "Bearer test-secret")
 
-    @patch("savings.views.paystack_request")
-    def test_bank_directory_fetches_all_pages_and_deduplicates_codes(self, paystack_request):
+    @patch.dict(
+        "os.environ",
+        {
+            "BANK_LIST": "https://api.paystack.co/bank?currency=NGN&enabled_for_verification=true",
+            "PAYSTACK_SECRET_KEY": "",
+            "NEXT_PAYSTACK_SECRET_KEY": "verifyme-test-secret",
+        },
+    )
+    @patch("savings.views.requests.get")
+    def test_bank_directory_uses_paystack_and_normalizes_bank_codes(self, get):
         self.client.force_authenticate(self.user)
-        first_page = [
-            {"name": f"Bank {index}", "code": str(index)}
-            for index in range(100)
-        ]
-        paystack_request.side_effect = [first_page, [first_page[0], {"name": "Last Bank", "code": "last"}]]
+        get.return_value.ok = True
+        get.return_value.json.return_value = {
+            "status": True,
+            "data": [
+                {"name": "Example Bank", "code": 120001},
+                {"name": "Example Bank", "code": "120001"},
+                {"name": "Last Bank", "code": "090270"},
+            ],
+        }
 
         response = self.client.get("/api/savings/bank-directory/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.data), 101)
-        self.assertEqual(response.data[-1], {"name": "Last Bank", "code": "last"})
-        self.assertEqual(paystack_request.call_count, 2)
-        self.assertEqual(paystack_request.call_args_list[0].kwargs["params"]["page"], 1)
-        self.assertEqual(paystack_request.call_args_list[1].kwargs["params"]["page"], 2)
+        self.assertEqual(
+            response.data,
+            [
+                {"name": "Example Bank", "code": "120001"},
+                {"name": "Last Bank", "code": "090270"},
+            ],
+        )
+        get.assert_called_once_with(
+            "https://api.paystack.co/bank?currency=NGN&enabled_for_verification=true",
+            headers={"Authorization": "Bearer verifyme-test-secret"},
+            timeout=(5, 20),
+        )
+
+    @patch.dict(
+        "os.environ",
+        {"PAYSTACK_SECRET_KEY": "", "NEXT_PAYSTACK_SECRET_KEY": ""},
+    )
+    def test_bank_directory_requires_paystack_credentials(self):
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get("/api/savings/bank-directory/")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Paystack", response.data["detail"])

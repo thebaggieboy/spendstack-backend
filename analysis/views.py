@@ -14,11 +14,12 @@ from .utils.parser import (
     parse_csv_statement_detailed,
     parse_excel_statement_detailed,
     parse_pdf_statement_detailed,
+    parse_text_statement_detailed,
     extract_statement_summary,
 )
 from .utils.categorizer import categorize_transactions
 from transactions.models import Transaction, Account, Category
-from .models import Statement, StatementPreview
+from .models import Statement, StatementPreview, StatementImportAttempt
 from transactions.models import TransactionRule
 from transactions.services import classify_transaction
 
@@ -42,13 +43,13 @@ def _parse_statement_file(file_obj, content):
     elif extension == ".pdf":
         import io
         raw_data, warnings = parse_pdf_statement_detailed(io.BytesIO(content))
+    elif extension == ".txt":
+        raw_data, warnings = parse_text_statement_detailed(content)
     else:
-        raise ValueError("Unsupported file format. Use CSV, Excel, or PDF.")
+        raise ValueError("Unsupported file format. Use CSV, Excel, PDF, or TXT.")
 
     if not raw_data:
         raise ValueError("No valid transactions were found in this statement.")
-    if len(raw_data) > 10000:
-        raise ValueError("Statements can contain up to 10,000 transactions per upload.")
 
     for index, tx in enumerate(raw_data):
         try:
@@ -79,12 +80,28 @@ def _parse_statement_file(file_obj, content):
             )
             tx["_invalid"] = True
         tx["raw_description"] = str(tx.get("raw_description", ""))
+        tx["is_pending"] = bool(tx.get("is_pending", False))
+        if tx.get("currency"):
+            currency = str(tx["currency"]).strip().upper()
+            if len(currency) != 3 or not currency.isalpha() or not currency.isascii():
+                warnings.append(
+                    f"Transaction {tx.get('source_row', index + 1)}: invalid currency code; not imported."
+                )
+                tx["_invalid"] = True
+            else:
+                tx["currency"] = currency
 
     raw_data = [tx for tx in raw_data if not tx.pop("_invalid", False)]
     if not raw_data:
         details = " ".join(warnings[:5])
         raise ValueError(
             f"No valid transactions were found in this statement. {details}".strip()
+        )
+    currencies = {tx["currency"] for tx in raw_data if tx.get("currency")}
+    if len(currencies) > 1:
+        raise ValueError(
+            "This statement contains multiple currencies. Import one currency per statement; "
+            "Spendstack does not convert amounts without an exchange rate."
         )
     for index, tx in enumerate(raw_data):
         tx["original_index"] = index
@@ -95,13 +112,24 @@ def _parse_statement_file(file_obj, content):
     return categorized_data, warnings
 
 
+def _record_failed_import(user, filename, detail):
+    StatementImportAttempt.objects.create(
+        user=user,
+        filename=os.path.basename(filename)[:255],
+        status="failed",
+        detail=str(detail)[:500],
+    )
+
+
 def _create_statement(user, filename, file_sha256, categorized_data, summary_data=None):
+    summary_data = summary_data if isinstance(summary_data, dict) else {}
+    statement_currency = str(summary_data.get("currency") or "").strip().upper()
     account, _ = Account.objects.get_or_create(name="Default Checking", user=user)
     statement = Statement.objects.create(
         user=user,
         filename=filename,
         file_sha256=file_sha256,
-        summary_data=summary_data or {},
+        summary_data=summary_data,
     )
     rules = list(
         TransactionRule.objects.filter(user=user, is_active=True).order_by("-priority", "id")
@@ -128,6 +156,9 @@ def _create_statement(user, filename, file_sha256, categorized_data, summary_dat
                 "raw_description": tx["raw_description"],
                 "category_name": cat_name,
                 "is_transfer": is_transfer,
+                "is_pending": tx.get("is_pending", False),
+                "currency": tx.get("currency") or statement_currency,
+                "source_id": tx.get("source_id", ""),
             }
         )
 
@@ -168,6 +199,9 @@ def _create_statement(user, filename, file_sha256, categorized_data, summary_dat
             raw_description=row["raw_description"],
             category=existing_categories[row["category_name"]],
             is_transfer=row["is_transfer"],
+            is_pending=row["is_pending"],
+            currency=row["currency"],
+            source_id=row["source_id"],
         )
         for row in transaction_rows
     ]
@@ -175,21 +209,29 @@ def _create_statement(user, filename, file_sha256, categorized_data, summary_dat
     return statement, created_transactions
 
 
-def _statement_reconciliation(summary_data, credits, debits):
+def _statement_reconciliation(summary_data, credits, debits, credit_count=0, debit_count=0):
     summary_data = summary_data if isinstance(summary_data, dict) else {}
     ambiguous_fields = set(summary_data.get("ambiguous_fields", []))
+    incomplete_fields = set(summary_data.get("incomplete_fields", []))
     row_net = credits + debits
     checks = {}
     mismatch = False
-    for field, row_value in (("total_credits", credits), ("total_debits", abs(debits))):
+    for field, row_value in (
+        ("total_credits", credits),
+        ("total_debits", abs(debits)),
+        ("credit_count", credit_count),
+        ("debit_count", debit_count),
+    ):
         reported = summary_data.get(field)
-        if field in ambiguous_fields:
+        if field in ambiguous_fields or field in incomplete_fields:
             checks[field] = {"status": "review", "reported": None, "from_transactions": float(row_value)}
         elif reported is None:
             checks[field] = {"status": "unavailable", "reported": None, "from_transactions": float(row_value)}
         else:
             reported_value = Decimal(str(reported))
-            difference = (row_value - reported_value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            difference = row_value - reported_value
+            if field in ("total_credits", "total_debits"):
+                difference = difference.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             matches = difference == 0
             mismatch = mismatch or not matches
             checks[field] = {
@@ -202,7 +244,12 @@ def _statement_reconciliation(summary_data, credits, debits):
     opening = summary_data.get("opening_balance")
     closing = summary_data.get("closing_balance")
     balance_check = {"status": "unavailable", "opening_balance": None, "closing_balance": None}
-    if "opening_balance" in ambiguous_fields or "closing_balance" in ambiguous_fields:
+    if (
+        "opening_balance" in ambiguous_fields
+        or "closing_balance" in ambiguous_fields
+        or "opening_balance" in incomplete_fields
+        or "closing_balance" in incomplete_fields
+    ):
         balance_check["status"] = "review"
     elif opening is not None and closing is not None:
         opening_value = Decimal(str(opening))
@@ -227,7 +274,10 @@ def _statement_reconciliation(summary_data, credits, debits):
 
     if mismatch:
         overall = "mismatch"
-    elif "review" in [check["status"] for check in checks.values()] or balance_check["status"] == "review":
+    elif (
+        "review" in [check["status"] for check in checks.values()]
+        or balance_check["status"] == "review"
+    ):
         overall = "review"
     elif any(check["status"] == "match" for check in checks.values()) or balance_check["status"] == "match":
         overall = "matched"
@@ -237,9 +287,18 @@ def _statement_reconciliation(summary_data, credits, debits):
         "status": overall,
         "statement_summary": {
             field: summary_data.get(field)
-            for field in ("opening_balance", "closing_balance", "total_credits", "total_debits")
+            for field in (
+                "opening_balance",
+                "closing_balance",
+                "total_credits",
+                "total_debits",
+                "credit_count",
+                "debit_count",
+            )
         },
         "ambiguous_fields": sorted(ambiguous_fields),
+        "incomplete_fields": sorted(incomplete_fields),
+        "sheet_summaries": summary_data.get("sheet_summaries", []),
         "checks": checks,
         "balance_movement": balance_check,
     }
@@ -274,10 +333,15 @@ class StatementPreviewView(APIView):
         file_obj = request.data.get("file")
         if not file_obj:
             return Response(
-                {"detail": "Choose a CSV, Excel, or PDF statement."},
+                {"detail": "Choose a CSV, Excel, PDF, or TXT statement."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if file_obj.size > MAX_STATEMENT_SIZE:
+            _record_failed_import(
+                request.user,
+                file_obj.name,
+                "Statement files must be 10 MB or smaller.",
+            )
             return Response({"detail": "Statement files must be 10 MB or smaller."}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
 
         content = file_obj.read()
@@ -295,12 +359,26 @@ class StatementPreviewView(APIView):
         try:
             categorized_data, warnings = _parse_statement_file(file_obj, content)
             summary_data = extract_statement_summary(content, file_obj.name)
+            currencies = {
+                tx.get("currency")
+                for tx in categorized_data
+                if tx.get("currency")
+            }
+            if len(currencies) == 1:
+                summary_data["currency"] = next(iter(currencies))
+            summary_data["parser_warnings"] = warnings
             categorized_data = _apply_user_rules(request.user, categorized_data)
         except ValueError as exc:
+            _record_failed_import(request.user, file_obj.name, exc)
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception:
             import logging
             logging.getLogger(__name__).exception("Statement preview failed.")
+            _record_failed_import(
+                request.user,
+                file_obj.name,
+                "The statement could not be read.",
+            )
             return Response(
                 {"detail": "We could not read this statement. Check the file and try again."},
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -333,10 +411,18 @@ class StatementPreviewView(APIView):
                         "category": tx.get("category_name", "Other"),
                         "is_transfer": tx.get("is_transfer", False),
                         "amount": tx["amount"],
+                        "status": tx.get("status", "posted"),
+                        "is_pending": tx.get("is_pending", False),
+                        "currency": tx.get("currency") or preview.summary_data.get("currency", ""),
+                        "source_id": tx.get("source_id", ""),
                     }
                     for index, tx in enumerate(categorized_data)
                 ],
                 "warnings": warnings,
+                "blocking_warnings": [
+                    warning for warning in warnings
+                    if "amount sign is ambiguous" in warning
+                ],
             },
             status=status.HTTP_201_CREATED,
         )
@@ -352,14 +438,18 @@ class StatementPreviewConfirmView(APIView):
         if preview.is_expired:
             preview.delete()
             return Response({"detail": "This preview has expired. Upload the statement again."}, status=status.HTTP_410_GONE)
-        if preview.warnings:
+        blocking_warnings = [
+            warning for warning in preview.warnings
+            if "amount sign is ambiguous" in warning
+        ]
+        if blocking_warnings:
             return Response(
                 {
                     "detail": (
-                        "This preview contains rows that could not be parsed without risk of data loss. "
-                        "Correct the statement or upload a cleaner CSV/Excel export before importing."
+                        "This preview contains transactions with an ambiguous debit/credit direction. "
+                        "Correct those rows before importing."
                     ),
-                    "warnings": preview.warnings,
+                    "warnings": blocking_warnings,
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -408,10 +498,15 @@ class StatementUploadView(APIView):
         file_obj = request.data.get("file")
         if not file_obj:
             return Response(
-                {"detail": "Choose a CSV, Excel, or PDF statement."},
+                {"detail": "Choose a CSV, Excel, PDF, or TXT statement."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if file_obj.size > MAX_STATEMENT_SIZE:
+            _record_failed_import(
+                request.user,
+                file_obj.name,
+                "Statement files must be 10 MB or smaller.",
+            )
             return Response({"detail": "Statement files must be 10 MB or smaller."}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
 
         content = file_obj.read()
@@ -422,14 +517,31 @@ class StatementUploadView(APIView):
         try:
             categorized_data, warnings = _parse_statement_file(file_obj, content)
             summary_data = extract_statement_summary(content, file_obj.name)
-            if warnings:
+            currencies = {
+                tx.get("currency")
+                for tx in categorized_data
+                if tx.get("currency")
+            }
+            if len(currencies) == 1:
+                summary_data["currency"] = next(iter(currencies))
+            summary_data["parser_warnings"] = warnings
+            blocking_warnings = [
+                warning for warning in warnings
+                if "amount sign is ambiguous" in warning
+            ]
+            if blocking_warnings:
+                _record_failed_import(
+                    request.user,
+                    file_obj.name,
+                    "Transaction debit/credit direction is ambiguous.",
+                )
                 return Response(
                     {
                         "detail": (
-                            "This statement contains rows that could not be parsed without risk of data loss. "
-                            "Use the preview flow to review the warnings before importing."
+                            "This statement contains transactions with an ambiguous debit/credit direction. "
+                            "Use the preview flow to review them before importing."
                         ),
-                        "warnings": warnings,
+                        "warnings": blocking_warnings,
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
@@ -442,12 +554,18 @@ class StatementUploadView(APIView):
                     summary_data,
                 )
         except ValueError as exc:
+            _record_failed_import(request.user, file_obj.name, exc)
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except IntegrityError:
             return Response({"detail": "This statement has already been uploaded."}, status=status.HTTP_409_CONFLICT)
         except Exception:
             import logging
             logging.getLogger(__name__).exception("Statement upload failed.")
+            _record_failed_import(
+                request.user,
+                file_obj.name,
+                "The statement could not be read.",
+            )
             return Response(
                 {"detail": "We could not import this statement. Please try again."},
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -458,6 +576,9 @@ class StatementUploadView(APIView):
                 "statement_id": statement.id,
                 "message": f"Successfully processed {len(created_transactions)} transactions.",
                 "status": "success",
+                "transaction_count": len(created_transactions),
+                "warnings": warnings,
+                "skipped_rows": sum("not imported." in warning for warning in warnings),
             },
             status=status.HTTP_201_CREATED,
         )
@@ -506,6 +627,8 @@ class StatementDetailView(APIView):
         financial_transactions = posted_transactions.filter(is_transfer=False)
         credits = posted_transactions.filter(amount__gt=0).aggregate(total=Sum('amount'))['total'] or Decimal("0.00")
         expenses = posted_transactions.filter(amount__lt=0).aggregate(total=Sum('amount'))['total'] or Decimal("0.00")
+        credit_count = posted_transactions.filter(amount__gt=0).count()
+        debit_count = posted_transactions.filter(amount__lt=0).count()
         highest_spend = (
             financial_transactions.filter(amount__lt=0)
             .values("date")
@@ -523,6 +646,7 @@ class StatementDetailView(APIView):
         # This is a cumulative flow from zero, not an account balance.
         tx_list = []
         cumulative_flow = Decimal("0.00")
+        statement_summary = stmt.summary_data if isinstance(stmt.summary_data, dict) else {}
         for tx in transactions:
             if not tx.is_pending:
                 cumulative_flow += tx.amount
@@ -533,10 +657,13 @@ class StatementDetailView(APIView):
                 "raw_description": tx.raw_description,
                 "merchant_name": tx.merchant_name or tx.raw_description[:40],
                 "amount": float(tx.amount),
+                "currency": tx.currency,
+                "source_id": tx.source_id,
                 "category": tx.category.name if tx.category else "Uncategorized",
                 "category_color": tx.category.color if tx.category else "#9ca3af",
                 "cumulative_flow": float(cumulative_flow),
                 "is_transfer": tx.is_transfer,
+                "is_pending": tx.is_pending,
             })
 
         # Category breakdown (expenses only)
@@ -578,12 +705,17 @@ class StatementDetailView(APIView):
         return Response({
             "id": stmt.id,
             "filename": stmt.filename,
+            "currency": statement_summary.get("currency", ""),
+            "parser_warnings": statement_summary.get("parser_warnings", []),
             "upload_date": stmt.upload_date.strftime('%B %d, %Y'),
             "stats": {
                 "total_credits": float(credits.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
                 "total_expenses": float(abs(expenses).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
                 "net": float((credits + expenses).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
-                "transaction_count": transactions.count(),
+                "transaction_count": posted_transactions.count(),
+                "credit_count": credit_count,
+                "debit_count": debit_count,
+                "pending_transaction_count": transactions.filter(is_pending=True).count(),
                 "merchant_count": merchant_count,
                 "highest_daily_spend": float(abs(highest_spend["total"]).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if highest_spend else 0.0,
                 "highest_daily_spend_date": highest_spend["date"].isoformat() if highest_spend else None,
@@ -592,6 +724,8 @@ class StatementDetailView(APIView):
                 stmt.summary_data,
                 credits,
                 expenses,
+                credit_count,
+                debit_count,
             ),
             "transactions": tx_list,
             "category_breakdown": category_data,

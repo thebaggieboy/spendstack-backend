@@ -32,6 +32,8 @@ class Transaction(models.Model):
     date = models.DateField()
     amount = models.DecimalField(max_digits=10, decimal_places=2) 
     # Convention: negative for expense, positive for income
+    currency = models.CharField(max_length=3, blank=True, default="")
+    source_id = models.CharField(max_length=255, blank=True, default="")
     
     merchant_name = models.CharField(max_length=255, blank=True)
     raw_description = models.TextField()
